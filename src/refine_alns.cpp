@@ -83,8 +83,7 @@ size_t ungapped_extend_impl(size_t size, F get_score_at, double max_dropoff)
         // or in unaligned sequence, whereas having a longer k-mer
         // matchrun has stronger signal that we're on a right track.
 
-        // note: not score>=max_score, to avoid extending into N-runs
-        if (score > max_score) {
+        if (score >= max_score) { // >= to prefer longer extensions
             max_score = std::max(max_score, score);
             best_endpos = i + 1;
         }
@@ -93,22 +92,6 @@ size_t ungapped_extend_impl(size_t size, F get_score_at, double max_dropoff)
     return best_endpos;
 }
 
-///////////////////////////////////////////////////////////////
-
-#if 0
-class CSmallIndex
-{
-};
-
-struct query_data_t
-{
-    fasta_seq_t seq;
-    CSmallIndex index;
-};
-#endif
-
-
-using ids_pair_t = std::pair<seq_id_str_t, seq_id_str_t>;
 
 void gx::UngappedExtendSegsInPlace(
                   const fasta_seq_t& qry_seq,
@@ -133,6 +116,16 @@ void gx::UngappedExtendSegsInPlace(
         }
     }
 
+    // Seeds matched with reduced alphabet might come over-extended,
+    // so we'll truncate segs by few bp first, and will re-extend using 2-bit-coding seq.
+    for (auto& seg : segs)
+        if (seg.len > 16)
+    {
+        seg.q += 8;
+        seg.s += 8;
+        seg.len -= 16;
+    }
+
     const len_t k_ext_cap = 2000;
 
     // TODO: To establish the extension params we need to assess the identity near the segment's ends.
@@ -143,7 +136,10 @@ void gx::UngappedExtendSegsInPlace(
     const pos1_t sbj_end_on_plus  = pos1_t(sbj_seq.size() + 1);
     const pos1_t sbj_end_on_minus = 0;
 
-    const auto extend_seg = [&](segment_t& seg, const segment_t* next_seg, float mismatch_score, float x_dropoff_score)
+    const auto extend_seg = [&](segment_t& seg, 
+                                const segment_t* next_seg,
+                                float mismatch_score, 
+                                float x_dropoff_score)
     {
         VERIFY(seg.valid());
 
@@ -221,7 +217,10 @@ void gx::UngappedExtendSegsInPlace(
     // NB: this is about 15% slower than single-round extensions.
     //
 
-    for (float mismatch_score : { -9.0f, -4.0f, -2.0f }) // -9 targets 90% identity; -4 targets 80% identity -2 targets 60% identity
+    // TODO: switch to default of 40 in the future. GP-35566
+    static const float x_dropoff_score = get_env("GX_UNGAPPED_DROPOFF_SCORE", 20.0f);
+
+    for (float mismatch_score : { -9.0f, -4.0f, -2.0f}) // -9 targets 90% identity; -4 targets 80% identity -2 targets 60% identity
         for (size_t reverse_orientation : { false, true })
     {
         if (reverse_orientation) {
@@ -230,8 +229,6 @@ void gx::UngappedExtendSegsInPlace(
 
         for (segment_t& seg : segs) {
             const segment_t* next_seg = &seg == &*(segs.end() - 1) ? nullptr : (&seg + 1);
-
-            static const float x_dropoff_score = 20;
             extend_seg(seg, next_seg, mismatch_score, x_dropoff_score);
         }
 

@@ -15,11 +15,11 @@ This file outlines how to run FCS-GX from the source code.
 - For downloading the database, `rclone` or `aria2c` installed and available from $PATH.
 
 ### Build
-- From the repository root, run `make`
+- From the repository root, run `make`.
 - After a successful build, run the following for the help menu. `./dist/run_gx --help`
 
    
-### Verify functionality by using a small *test-only* database
+### Verify functionality by using a small *test-only* database.
 - Create a folder in your shared memory space. This is where you will save the GX database.  
     ```mkdir /dev/shm/gxdb```
     
@@ -99,10 +99,6 @@ Please see the [GitHub documentation](https://github.com/ncbi/fcs/wiki/FCS-GX) f
 ## Releases
 
 Please see [release history](https://github.com/ncbi/fcs/releases) 
-
-## Publications
-
-[Read the FCS-GX paper in BioRxiv.](https://www.biorxiv.org/content/10.1101/2023.06.02.543519v1)  
 
 ## Contact
 

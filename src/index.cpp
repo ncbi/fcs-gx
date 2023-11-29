@@ -42,22 +42,20 @@ struct key38_t
     uint32_t key30; // index into bucket (m_buckets)
     uint8_t  key8;  // attached to the value; hits are looked-up within sub-bucket with std::equal_range
 
-    key38_t(uint64_t a = 0)
-      : key30(a & Ob1x(30))
-      , key8((a >> 30) & Ob1x(8))
-    {
-        VERIFY(a >> 38 == 0);
-    }
+    key38_t(gx::CIndex::hmer38_t h)
+      : key30{ uint32_t(h.w & Ob1x(30)) }
+      , key8{ uint8_t(h.w >> 30) }
+    {}
 };
 
 
-void gx::CIndex::insert(const minword38_t minword, seq_oid_t seq_oid, pos1_t pos)
+void gx::CIndex::insert(const hmer38_t hmer, seq_oid_t seq_oid, pos1_t pos)
 {
     ASSERT(!m_finalized);
 
-    VERIFY(minword.is_flipped == (pos < 0));
+    VERIFY(hmer.is_flipped == (pos < 0));
 
-    const key38_t key{ minword.w };
+    const key38_t key{ hmer };
 
     auto& nodes = m_buckets[key.key30];
 
@@ -105,7 +103,7 @@ void gx::CIndex::finalize(const seq_infos_t& seq_infos)
                            [&](const auto subnodes_v) // having the same subkey8 and tax-id
         {
             // Keep first few nodes for the key; mark rest for deletion by setting pos=0.
-            for(const auto it : irange{ subnodes_v.begin() + 4, subnodes_v.end() }) {
+            for(const auto it : irange{ subnodes_v.begin() + 2, subnodes_v.end() }) {
                 it->pos = 0;
             }
         });
@@ -124,52 +122,63 @@ void gx::CIndex::finalize(const seq_infos_t& seq_infos)
 
 /////////////////////////////////////////////////////////////////////////
 
-#if 0
-// Disabling. Does not seem to be any better than std::equal_range when multithreaded.
+#define BRANCHLESS_EQUAL_RANGE 0
+
+#if BRANCHLESS_EQUAL_RANGE
+
+#pragma message "Using experimental branchless equal_range()"
+namespace branchless
+{
 
 template<typename Iterator, typename T, typename Compare>
-auto my_equal_range( Iterator first,
-                     Iterator last,
-                     const T& value,
-                      Compare comp) -> std::pair<Iterator, Iterator>
+Iterator lower_bound(Iterator begin, Iterator end, const T& value, Compare comp)
 {
-    auto len = std::distance(first, last);
+    // https://orlp.net/blog/bitwise-binary-search/
+    // https://en.algorithmica.org/hpc/data-structures/binary-search/
 
-    while (len > 0) {
-        auto half = len >> 1;
-        Iterator middle = first;
-        std::advance(middle, half);
-
-        //https://www.daemon-systems.org/man/__builtin_prefetch.3.html
-        // prefetch &*middle for the next round here.
-        __builtin_prefetch(&*(middle+1 + ((len - half - 1) >> 1)), 0, 1); //https://www.daemon-systems.org/man/__builtin_prefetch.3.html
-        __builtin_prefetch(&*(first + ((half) >> 1)), 0, 1);
-
-        if (comp(*middle, value)) {
-            first = ++middle;
-            len -= half + 1;
-        } else if (comp(value, *middle)) {
-            last = middle;
-            len = half;
-        } else {
-            auto mp1 = middle;
-            return {
-                std::lower_bound(first, middle, value, comp),
-                std::upper_bound(++mp1, last, value, comp)
-            };
-        }
+    size_t n = end - begin;
+    while (n > 1) {
+        const auto half = n / 2;
+        begin += comp(begin[half - 1], value) ? half : 0;
+        n -= half;
     }
 
-    return {first, first};
+    // NB: there's a bug (missing handling for n == 1) in the reference implementation.
+    return begin + (n == 1 && comp(*begin, value));
+}
+
+template<typename Iterator, typename T, typename Compare>
+Iterator upper_bound(Iterator begin, Iterator end, const T& value, Compare comp)
+{
+    const size_t n = end - begin;
+    const auto comp_lteq = [&](const T& a, const T& b){ return !comp(b, a); };
+
+    // https://en.wikipedia.org/wiki/Exponential_search
+    size_t i = 1;
+    while (i < n && comp_lteq(begin[i], value)) {
+        i <<= 1;
+    }
+
+    return branchless::lower_bound(begin + (i >> 1), begin + std::min(i + 1, n), value, comp_lteq);
+}
+
+template<typename Iterator, typename T, typename Compare>
+auto equal_range(Iterator begin, Iterator end, const T& value, Compare comp) -> std::pair<Iterator, Iterator>
+{
+    auto b = branchless::lower_bound(begin, end, value, std::ref(comp));
+    auto e = branchless::upper_bound(b,     end, value, std::ref(comp));
+    return { b, e };
+}
+
 }
 #endif
 
 
-gx::CIndex::nodes_view_t gx::CIndex::at(minword38_t minword) const
+gx::CIndex::nodes_view_t gx::CIndex::at(hmer38_t hmer) const
 {
     ASSERT(m_finalized);
 
-    const key38_t key{ minword.w };
+    const key38_t key{ hmer };
 
     VERIFY((m_subcounts32 == nullptr) == (m_nodes_ptr == nullptr));
     VERIFY(!m_buckets.empty() ^ (m_subcounts32 != nullptr));
@@ -180,9 +189,12 @@ gx::CIndex::nodes_view_t gx::CIndex::at(minword38_t minword) const
 
                           : nodes_view_t{ m_buckets[key.key30].data(),
                                           m_buckets[key.key30].data() + m_buckets[key.key30].size() };
-
     auto begin_end =
-            std::equal_range( // my_equal_range or std::equal_range
+#if BRANCHLESS_EQUAL_RANGE
+            branchless::equal_range(
+#else
+            std::equal_range(
+#endif
                  nodes_view.begin(), nodes_view.end(),
                  node_t{ seq_oid_t{}, pos1_t{}, key.key8 },
                  BY(_.subkey8));
@@ -217,11 +229,11 @@ gx::CIndex::nodes_view_t gx::CIndex::at(minword38_t minword) const
 #if 0
 // Experimental implementation for: GP-33268
 
-gx::CIndex::nodes_view_t gx::CIndex::at(minword38_t minword) const
+gx::CIndex::nodes_view_t gx::CIndex::at(hmer38_t hmer) const
 {
     ASSERT(m_finalized);
 
-    const auto key = key38_t{ minword.w };
+    const auto key = key38_t{ hmer };
 
     VERIFY((m_subcounts32 == nullptr) == (m_nodes_ptr == nullptr));
     VERIFY(!m_buckets.empty() ^ (m_subcounts32 != nullptr));

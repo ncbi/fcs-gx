@@ -37,14 +37,10 @@ CSmallIndex gx::MakeQueryIndex(const fasta_seq_t& qry, CSmallIndex index)
 {
     index.clear();
 
-    const auto bits = bool_na_view_t{ qry.seq };
-    auto buf = skip_mod3_buf_t::init_from(bits, CSmallIndex::k_word_tlen);
-
-    for (const auto i : irange{ CSmallIndex::k_word_tlen, bits.size() }) {
-        buf <<= bits[i];
-        const auto minword = CSmallIndex::minword20_t{ buf };
-        const auto pos1 = CSmallIndex::make_word_start_pos1(i + qry.offset, minword.is_flipped);
-        index.insert(minword, pos1);
+    for (auto kmer = kmer_ci_t(qry.seq, CSmallIndex::k_word_tlen); kmer; ++kmer) {
+        const auto hmer = CSmallIndex::hmer20_t{ kmer.buf };
+        const auto ivl = as_ivl(kmer.i + qry.offset, CSmallIndex::k_word_tlen, hmer.is_flipped);
+        index.insert(hmer, ivl.pos);
     }
 
     if (!qry.seq.empty()) {
@@ -267,14 +263,14 @@ segments_t gx::SeedRound2(
     filter.reset(&segs, filter_size);
 
     // view of subj seq in interval's coordinate system.
-    struct bits_view_t
+    struct seq_view_t
     {
         const sbj_seq_t& sbj_seq;
         const ivl_t ivl;
 
-        bool_na_t operator[](const size_t i) const
+        na_t operator[](const size_t i) const
         {
-            return sbj_seq.at1_as_bool_na_t(pos1_t(ivl.pos + (int32_t)i));
+            return sbj_seq.at1(pos1_t(ivl.pos + (int32_t)i));
         }
 
         size_t size() const
@@ -286,15 +282,12 @@ segments_t gx::SeedRound2(
     size_t num_pushed = 0;
 
     for (const auto& ivl : sbj_ivls) {
-        const bits_view_t bits{ sbj_seq, ivl };
+        const auto seq_view = seq_view_t{ sbj_seq, ivl };
+        for (auto kmer = kmer_ci_t(seq_view, CSmallIndex::k_word_tlen); kmer; ++kmer) {
 
-        auto buf = skip_mod3_buf_t::init_from(bits, CSmallIndex::k_word_tlen);
-        for (const auto i : irange{ CSmallIndex::k_word_tlen, bits.size() }) {
-            buf <<= bits[i];
-
-            const auto minword = CSmallIndex::minword20_t{ buf };
-            const auto hits    = index.at(minword);
-            const auto sbj_pos = CSmallIndex::make_word_start_pos1(size_t(ivl.pos-1) + i, minword.is_flipped); // pos-1 to make 0-based
+            const auto hmer    = CSmallIndex::hmer20_t{ kmer.buf };
+            const auto hits    = index.at(hmer);
+            const auto sbj_pos = as_ivl(as_pos0(ivl.pos) + kmer.i, CSmallIndex::k_word_tlen, hmer.is_flipped).pos;
 
             if (hits.size() <= 10)
                 for (const auto& h : hits)

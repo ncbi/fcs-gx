@@ -86,6 +86,11 @@ std::string gx::MakeProtsetMinhash(std::istream& fasta_istr)
 
     // https://www.researchgate.net/publication/221596285_Bottom-k_sketches_Better_and_more_efficient_estimation_of_aggregates
     auto unique_mers_count = 0ul;
+
+    // if enabled, will only process words that have important_aas in the mid-position
+    // (improves sensitivity for large proteomes, but degrades for short proteomes (proks, organelles))
+    static const bool enable_aa_subsampling = get_env("GX_PROT_MINHASH_ENABLE_AA_SUBSAMPLING", false);
+
     auto bottom_sketch = std::priority_queue<uint64_t>{}; // capped at 100k
     {
         auto seen_seqs = std::set<uint64_t>();
@@ -103,7 +108,10 @@ std::string gx::MakeProtsetMinhash(std::istream& fasta_istr)
                 buf = buf << alphabet_bitwidth | reduced_alphabet[aa];
                 const auto mer = buf & Ob1x(mer_bitwidth);
 
-                if (i < min_i || !important_aas[seq.seq[i - (min_i / 2)]] || seen_mers[mer]) {
+                if (   i < min_i 
+                    || (enable_aa_subsampling && !important_aas[seq.seq[i - (min_i / 2)]])
+                    || seen_mers[mer])
+                {
                     continue;
                 }
 
@@ -196,6 +204,7 @@ void gx::PairwiseCompareMinHashes(std::istream& istr, std::ostream& ostr)
 
     auto t = timer{};
 
+    ostr << "#id-1\tid-2\tsimilarity\n";
     // TODO: can parallelize, but for now fast-enough.
     for (const auto i : irange{ inps.size() })
         for (const auto j : irange{ i + 1, inps.size() })

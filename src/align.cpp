@@ -241,7 +241,7 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
     // We need to do multiple passes over hitses, so we precompute these.
     using nodes_view_t = CIndex::nodes_view_t;
     static thread_local std::vector<nodes_view_t> hitses{};
-    static thread_local std::vector<bool> is_flippeds{}; // whether i'th query-minword is flipped
+    static thread_local std::vector<bool> is_flippeds{}; // whether i'th query-hmer is flipped
     {
         hitses.clear();
         hitses.resize(qry_len);
@@ -249,14 +249,10 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
         is_flippeds.clear();
         is_flippeds.resize(qry_len);
 
-        const auto seq_1bit = bool_na_view_t{ qry.seq };
-        auto buf = skip_mod3_buf_t::init_from(seq_1bit, CIndex::k_word_tlen);
-        for (const auto i : irange{ CIndex::k_word_tlen, qry_len} ) {
-            buf <<= seq_1bit[i];
-            const auto minword = CIndex::minword38_t{ buf };
-
-            hitses[i]      = index.at(minword);
-            is_flippeds[i] = minword.is_flipped;
+        for (auto kmer = kmer_ci_t(qry.seq, CIndex::k_word_tlen); kmer; ++kmer) {
+            const auto hmer     = CIndex::hmer38_t{ kmer.buf };
+            hitses[kmer.i]      = index.at(hmer);
+            is_flippeds[kmer.i] = hmer.is_flipped;
         }
     }
 
@@ -346,7 +342,7 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
         const auto max_occ_thr = (size_t)std::max(20.0, gmean_occ * 4);
 
         for (size_t i = 0; i < qry_len; ++i) {
-            const auto q_pos = CIndex::make_word_start_pos1(i, is_flippeds[i]);
+            const auto q_pos = as_ivl(i, CIndex::k_word_tlen, is_flippeds[i]).pos;
             const nodes_view_t hits = hitses[i];
 
             for (const auto& h : hits)
@@ -396,7 +392,7 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
         const auto min_count = fn::first_or_default(fn::cfrom(h_oid2count) % fn::take_top_n(20));
 
         for (size_t i = 0; i < qry_len; ++i) {
-            const auto q_pos = CIndex::make_word_start_pos1(i, is_flippeds[i]);
+            const auto q_pos = as_ivl(i, CIndex::k_word_tlen, is_flippeds[i]).pos;
             for (const auto& h : hitses[i])
                 if (h_oid2count[uint64_hash(+h.seq_oid) % h_oid2count.size()] > min_count)
                 // NB: >, not >=, as there may be arbitrarily many
@@ -471,6 +467,7 @@ static std::string format_output(
     const std::string no_suffix_seq_id = tsv::split_on_delim{'~'}(inp_chunk.seq_id)[0];
 
     static const bool s_report_self_alignments = get_env("GX_REPORT_SELF_ALIGNMENTS", false);
+    static const float s_min_pct_idty = get_env("GX_MIN_PCT_IDENTITY", 40.0f);
 
     for (const auto& seg : prelim_align_result.segs) {
 
@@ -483,12 +480,9 @@ static std::string format_output(
         const auto sbj_seq   = get_sbj_seq(seg.s_oid);
         const auto scores    = scores_t(inp_chunk, sbj_seq, seg);
 
-#if 0
-        // don't print the garbage with <50% pct-identity TODO: select better cutoff
-        if (scores.num_mismatches * 2 > (size_t)seg.len) {
-            continue;
+        if ((float)scores.num_mismatches > (float)seg.len * (1.0 - (s_min_pct_idty / 100.0f))) {
+             continue;
         }
-#endif
 
         ostr         << inp_chunk.seq_id << "\t" << seg.q
              << "\t" << +sbj_info.tax_id
@@ -759,7 +753,7 @@ std::string add_db_info(std::string metaline, std::string db_path)
 {
     // NB: for not using open_ifstr_opt, as for now existence of .meta.jsonl is optional
     errno = 0;
-    std::ifstream ifstr{ str::replace(db_path, ".gxi", ".meta.jsonl") };
+    std::ifstream ifstr{ str::replace_suffix(db_path, ".gxi", ".meta.jsonl") };
     if (!ifstr) {
         errno = 0;
         return metaline;
@@ -781,7 +775,7 @@ void gx::ProcessQueries(  const std::string& db_path,
                                std::istream& fasta_istr,
                                std::ostream& ostr)
 {
-    const std::string gxs_file_path = str::replace(db_path, ".gxi", ".gxs");
+    const std::string gxs_file_path = str::replace_suffix(db_path, ".gxi", ".gxs");
     const std::string_view mmapped_seq_db = ser::mmap(gxs_file_path);
     const std::string_view mmapped_db = ser::mmap(db_path);
 
@@ -803,7 +797,7 @@ void gx::ProcessQueries(  const std::string& db_path,
 
     const tax_map_t taxa = LoadTaxa(open_ifstream_opt(
                 !taxa_path.empty() ? taxa_path
-                                   : str::replace(db_path, ".gxi", ".taxa.tsv")).get());
+                                   : str::replace_suffix(db_path, ".gxi", ".taxa.tsv")).get());
 
     // Verify the size of mmapped_db (.gxi) and mmapped_seq_db (.gxs), e.g. that files are not truncated.
     {

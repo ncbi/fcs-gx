@@ -28,6 +28,7 @@
 #include "serial_util.hpp"
 
 #include <map>
+#include <set>
 #include <cctype>
 #include <sstream>
 
@@ -53,6 +54,81 @@ static const std::array<bool, 256> s_is_valid_iupacna = []
 
     return ret;
 }();
+
+
+// GP-35596: Replace '~' with '{TILDE}', except for "our" suffixes, e.g.
+// my_id~123..456
+// my_id~~123..456
+// my_id~123..456~~12..34
+static std::pair<bool, std::string> escape_foreign_tildes(std::string seq_id)
+{
+    static const bool enabled = get_env("GX_ESCAPE_TILDE", true);
+
+    if (seq_id.empty() || !enabled) {
+        return std::make_pair(false, std::move(seq_id));
+    }
+
+    // forbid this case, because after appending the GX-loc we don't know whether
+    // the tilde is "ours" or "original": e.g. "my_id~" -> "my_id~~123..456"
+    if (seq_id.back() == '~') {
+        std::cerr << "seq-ids cannot end with tilde (~): " << seq_id << "\n";
+        VERIFY(false);
+    }
+
+    // [0..i) will have the original user-seq-id; [i..seq_id.size()) will be the GX's loc-suffix.
+    size_t i = seq_id.size() - 1;
+
+    auto skip_back = [&](auto pred)
+    {
+        size_t n = 0;
+        while (i > 0 && pred(seq_id[i])) {
+            --i;
+            ++n;
+        }
+        return n;
+    };
+
+    // repeatedly skip-back /[~]+\d+\.\.\d+$/ loc-suffix.
+    while (    skip_back L(std::isdigit(_)) > 0
+            && skip_back L(_ == '.')       == 2
+            && skip_back L(std::isdigit(_)) > 0
+            && skip_back L(_ == '~')        > 0
+          )
+    {
+        ;
+    }
+
+    ++i; // convert to exclusive endpos.
+
+    if (const auto endpos = seq_id.begin() + i; std::find(seq_id.begin(), endpos, '~') == endpos) {
+        return std::make_pair(false, std::move(seq_id)); // no foreign tildes found
+    }
+
+    // Print warning once per execution if any seq-ids had tildes.
+    for (static bool s_printed_warning = false; 
+                    !s_printed_warning && !str::startswith(seq_id, "my-");  // used in test below
+                     s_printed_warning = true)
+    {
+        std::cerr << "\n\nWarning: some input seq-ids, e.g. " << seq_id << " contains tilde (~) character - "
+                  << "will replace it with {TILDE} in the interim GX output, and back to '~' in the final report.\n\n";
+    }
+
+    // NB: the input seq-id may already have {TILDE}, e.g. when input is output of split-fasta.
+    // Replace foreign tildes in the prefix; append GX loc-suffix.
+    seq_id = str::replace(seq_id.substr(0, i), "~", "{TILDE}") + seq_id.substr(i);
+    return std::make_pair(true, std::move(seq_id));
+}
+
+static bool test_escape_foreign_tildes = []
+{
+    VERIFY(escape_foreign_tildes("my-id").first == false);
+    VERIFY(escape_foreign_tildes("my-id~123..456~~123..456").first == false);
+
+    VERIFY(escape_foreign_tildes("my-~~id").second == "my-{TILDE}{TILDE}id");
+    VERIFY(escape_foreign_tildes("my-~~id~123..456~~123..456").second == "my-{TILDE}{TILDE}id~123..456~~123..456");
+    return true;
+}();
+
 
 /////////////////////////////////////////////////////////////////////////////
 // Strip gi|\d+| prefix if followed by prefixed accver; strip trailing pipe.
@@ -119,6 +195,8 @@ static seq_id_str_t extract_seq_id(std::string defline)
         break;
     }
 
+    seq_id = escape_foreign_tildes(std::move(seq_id)).second;
+
     VERIFY(!seq_id.empty());
     return seq_id_str_t{ std::move(seq_id) };
 }
@@ -156,7 +234,9 @@ static bool consume_fasta_line(const std::string& line, validate_iupacna_t valid
         ;
     } else if (line.front() != '>') { // not a defline
 
-        VERIFY(!next_inp.seq_id.empty()); // expecting seq-id to have been read
+        if (next_inp.seq_id.empty()) {
+            GX_THROW("Missing FASTA header (defline).");
+        }
 
         if (validate_iupacna == validate_iupacna_t::yes)
             for (const char na : line)
@@ -217,13 +297,27 @@ fn::any_seq_t<gx::fasta_seq_t> gx::MakeFastaReader(
           , get_next_line = rangeless::tsv::get_next_line(istr)
           ,      next_inp = fasta_seq_t()
           ,   reached_eof = false
+          ,      seen_ids = std::set<seq_id_str_t>()
         ] () mutable -> fasta_seq_t
     {
         const size_t target_chunk_size = chunk_stride + overlap_size;
 
         while (!reached_eof && next_inp.seq.size() < target_chunk_size) try {
             if (const auto& line = get_next_line(); !consume_fasta_line(line, validate_iupacna, next_inp)) {
-                return std::exchange(next_inp, fasta_seq_t{ extract_seq_id(line), {}, line, 0UL, {} });
+                auto seq_id = extract_seq_id(line);
+
+                if (static const bool ignore_duplicate_ids = get_env("GX_FASTA_IGNORE_DUPLICATE_IDS", false); 
+                    !ignore_duplicate_ids)
+                {
+                    if (seen_ids.empty()) {
+                        seen_ids.insert(next_inp.seq_id); // very first seq-id.
+                    }
+                    
+                    if (!seen_ids.insert(seq_id).second) {
+                        GX_THROW("Duplicate seq-id in the input fasta: " + seq_id + "; defline:\n" + line.get());
+                    }
+                }
+                return std::exchange(next_inp, fasta_seq_t{ std::move(seq_id), {}, line, 0UL, {} });
             }
         } catch (const fn::end_seq::exception&) { // from get_next_line()
             reached_eof = true;
@@ -376,13 +470,62 @@ static void write_fasta_seq(std::ostream& ostr, const gx::fasta_seq_t& fasta_seq
     const auto len = fasta_seq.seq.size();
     const auto fasta_line_width = s_get_fasta_line_width(len);
 
-    ostr << fasta_seq.defline << "\n";
+    ostr << fasta_seq.defline << "\n" << std::flush;
+
+    if (fasta_seq.seq.empty()) {
+        std::cerr << "Warning: Sequence is empty: "
+                  << fasta_seq.defline << std::endl;
+
+    } else if (   std::toupper((int)fasta_seq.seq.front()) == 'N'
+               || std::toupper((int)fasta_seq.seq.back())  == 'N')
+    {
+        std::cerr << "Warning: Unexpected Ns at the beginning or end of the sequence: " 
+                  << fasta_seq.defline << std::endl;
+    }
+
     for (size_t i = 0; i < len; i += fasta_line_width) {
         ostr.write(fasta_seq.seq.data() + i, std::min(fasta_line_width, len - i));
         ostr << "\n";
     }
-    ostr << std::endl;
+    // ostr << std::endl; // GP-35853
 }
+
+
+// parse ivls in the form "185053..185077,185178..185203,..."
+static ivls_t parse_ivls(const std::string& s)
+{
+    VERIFY(!str::contains(s, " "));
+    namespace tsv = rangeless::tsv;
+
+    // TODO: investigate why it's not firing
+    const auto execption_guard = make_exception_scope_guard([&]
+    {
+        std::cerr << "NB: " << GX_SOURCE_LOCATION_STR << ": while parsing; '" << s << "'" << std::endl;
+    });
+
+    return
+        tsv::split_on_delim{','}(str::replace(s, "..", " "))
+      % fn::transform([](const std::string& ivl_str)
+        {
+            const auto pair = tsv::split_on_delim{' '}(ivl_str);
+            VERIFY(pair.size() == 2);
+
+            auto start = (pos1_t)tsv::to_num(pair[0]);
+            auto stop =  (pos1_t)tsv::to_num(pair[1]);
+            VERIFY(0 < start && start <= stop);
+
+            return ivl_t{ start, stop + 1 - start };
+        })
+      % fn::to_vector();
+}
+
+static const bool test_parse_ivls = []
+{
+    VERIFY((parse_ivls("100..200,300..350") == ivls_t{ {100,101}, {300,51} }));
+    return true;
+}();
+
+
 
 // GP-34579
 void gx::ApplyActionReport(
@@ -405,18 +548,27 @@ void gx::ApplyActionReport(
                   agg_cont_cov[  7 ]:  100
                   top_tax_name[  8 ]:  Delftia sp.
 	*/
-    ConsumeMetalineHeader(action_report_istr, GX_TSV_HEADER__FCS_GENOME_RPT);
 
-    struct action_t
+    // Now also need to support the FCS-adapter style report that doesn't have the metaline header.
+    //ConsumeMetalineHeader(action_report_istr, GX_TSV_HEADER__FCS_GENOME_RPT);
+
+    enum class action_t { 
+        mask,  // replace interval with Ns
+        erase, // erase interval from the sequence
+        split  // split the sequence in two around the interval
+    };
+
+    struct action_ivl_t
     {
         ivl_t ivl = ivl_t{};
-        bool erase = true; // otherwise replace with Ns
+        action_t action = action_t::mask;
     };
 
     // Load action-report
-    auto actions   = std::map<seq_id_str_t, std::vector<action_t>>{};
+    auto actions   = std::map<seq_id_str_t, std::vector<action_ivl_t>>{};
     auto seq_lens  = std::map<seq_id_str_t, len_t>{};
     size_t row_num = 0;
+
     for (const tsv::row_t& row : tsv::from(action_report_istr)) {
         ++row_num;
 
@@ -429,18 +581,24 @@ void gx::ApplyActionReport(
             std::cerr << std::endl;
         });
 
+        if (str::startswith(row[0], "##")) {
+            continue;
+        }
+
         if (str::startswith(row[0], "#") || (row.size() == 1 && row[0] == "")) {
 			continue;
 		}
 
-        VERIFY(row.size() == 8);
+        const bool old_style = row.size() == 5; // 5-column action-report is the fcs-adaptor style.
+                                                // #accession      length  action  range   name
+        VERIFY(row.size() == 8 || old_style); 
 
-        const auto seq_id = seq_id_str_t{ row[0] };
-        const len_t start_pos = tsv::to_num(row[1]);
-        const len_t stop_pos  = tsv::to_num(row[2]);
-        const len_t seq_len   = tsv::to_num(row[3]);
-        const auto& action    = row[4];
-        const auto action_ivl = ivl_t{ start_pos, stop_pos + 1 - start_pos };
+        const auto seq_id     = seq_id_str_t{ row[0] };
+        const len_t seq_len   = tsv::to_num(row[old_style ? 1 : 3]);
+        const auto& action    = row[old_style ? 2 : 4];
+
+        const auto ivls       = old_style && row[3].empty() ? ivls_t{{ ivl_t{1, seq_len} }}
+                              : parse_ivls(old_style ? row[3] : (row[1] + ".." + row[2]));
 
         {
             auto& len = seq_lens[seq_id];
@@ -448,25 +606,38 @@ void gx::ApplyActionReport(
             len = seq_len;
         }
 
-        VERIFY(1         <= start_pos);
-        VERIFY(start_pos <= stop_pos);
-        VERIFY(stop_pos  <= seq_len);
+        for (const auto& ivl : ivls) {
+            const auto stop_pos = ivl.endpos() - 1;
+            VERIFY(stop_pos <= seq_len);
 
-        VERIFY(action != "EXCLUDE" || ((start_pos == 1) && (stop_pos == seq_len)));
-        VERIFY(action != "TRIM"    || ((start_pos == 1) ^  (stop_pos == seq_len)));
-        VERIFY(action != "FIX"     || ((start_pos != 1) && (stop_pos != seq_len)));
+            VERIFY(action != "EXCLUDE"        || ((ivl.pos == 1) && (stop_pos == seq_len)));
+            VERIFY(action != "ACTION_EXCLUDE" || ((ivl.pos == 1) && (stop_pos == seq_len)));
+            VERIFY(action != "TRIM"    || ((ivl.pos == 1) ^  (stop_pos == seq_len)));
+            VERIFY(action != "FIX"     || ((ivl.pos != 1) && (stop_pos != seq_len)));
 
-        if (action == "TRIM" || action == "EXCLUDE" || action == "FIX") {
-            actions[seq_id].push_back(action_t{ action_ivl, /*erase=*/action != "FIX" });
+            if (   action == "ACTION_TRIM" || action == "SPLIT"                          // split
+                || action == "TRIM" || action == "EXCLUDE" || action == "ACTION_EXCLUDE" // erase (splice-out)
+                || action == "FIX")                                                      // mask
+            {
+                actions[seq_id].push_back(action_ivl_t{ 
+                        ivl, 
+                        action == "FIX"          ? action_t::mask
+                      : action == "ACTION_TRIM"  ? action_t::split
+                      : action == "SPLIT"        ? action_t::split
+                      :                            action_t::erase
+                });
+            } else {
+                VERIFY(str::startswith(action, "REVIEW") || action == "INFO");
+            }
         }
     }
 
     for (auto& kv : actions) {
         kv.second %= fn::sort_by L(_.ivl);
+
         kv.second %= fn::reverse(); // will process actions back-to-front, such that 
                                     // length-changing ops do not affect next action's coordinates.
     }
-
 
     // Apply actions to the input fasta.
     auto actions_count = 0ul;
@@ -487,10 +658,19 @@ void gx::ApplyActionReport(
         }
 
         bool written_this_contam_seq = false;
-        for (const auto& action : at_or_default(actions, fasta_seq.seq_id)) {
+        const auto& seq_actions = at_or_default(actions, fasta_seq.seq_id);
+        const size_t num_splits = std::count_if(seq_actions.begin(), seq_actions.end(), L(_.action == action_t::split));
+
+        for (const auto& action : seq_actions) {
+            const auto execption_guard = make_exception_scope_guard([&]
+            {
+                std::cerr << "NB: " << GX_SOURCE_LOCATION_STR 
+                          << ": while processing action on " << fasta_seq.seq_id 
+                          << " @ " << action.ivl.to_string() << "\n";
+            });
 
             // Write whole-sequence-exclude cases to contam_fasta_out_ofstr
-            if (   action.erase
+            if (   action.action == action_t::erase
                 && (size_t)action.ivl.len == fasta_seq.seq.size()
                 && contam_fasta_out_ofstr
                 && !written_this_contam_seq)
@@ -499,10 +679,29 @@ void gx::ApplyActionReport(
                 written_this_contam_seq = true; // to output this seq only once, in case of multiple actions.
             }
 
-            if (action.erase) {
+            if (action.action == action_t::erase) {
                 VERIFY(action.ivl.endpos() <= (int64_t)fasta_seq.seq.size() + 1);
                 fasta_seq.seq.erase(action.ivl.pos - 1, action.ivl.len);
                 num_erased_bases += action.ivl.len;
+
+            } else if (action.action == action_t::split) {
+
+                // write-out tail after the interval; truncate fasta_seq to beginning of the interval.
+                fasta_seq_t chunk{};
+                chunk.seq     = iupacna_seq_t{ fasta_seq.seq.substr(action.ivl.endpos() - 1) };
+
+                chunk.defline = ">" + fasta_seq.seq_id 
+                              + "~" + std::to_string(action.ivl.endpos())
+                              + ".." + std::to_string(action.ivl.endpos() + chunk.seq.size() - 1);
+
+                fasta_seq.seq.resize(action.ivl.pos - 1);
+
+                if (chunk.seq.size() > min_seq_len) {
+                    write_fasta_seq(ostr, chunk);
+                } else {
+                    // write to chunk to contam_fasta_out_ofstr?
+                }
+
             } else {
                 std::fill(fasta_seq.seq.begin() + action.ivl.pos - 1, 
                           fasta_seq.seq.begin() + action.ivl.endpos() - 1,
@@ -512,7 +711,13 @@ void gx::ApplyActionReport(
             ++actions_count;
         }
 
+        // if had splits, append the interval to the seq-id
+        if (num_splits > 0) {
+            fasta_seq.defline = ">" + fasta_seq.seq_id + "~1.." + std::to_string(fasta_seq.seq.size());
+        }
+
         if (fasta_seq.seq.size() >= min_seq_len) {
+
             write_fasta_seq(ostr, fasta_seq);
 
         } else if (   fasta_seq.seq.size() > 0 
@@ -537,33 +742,36 @@ static const bool test_apply_action_report = []
     auto fasta_istr = std::stringstream{R"(
 >seq1
 ACGTA
-
 >seq2
 AAAAAAAAAAAAAAAA
-
 >seq3
 AA
-
 >seq4
 ACGT
-
+>seq5
+ACGTNNNNNTGCANNACGT
 )"};
 
-    auto actions_istr = std::stringstream{"##[[\"FCS genome report\", 2, 1]]" + str::replace_all(R"(
-seq1,1,2,5,TRIM,.,.,trim AC fram ACGTA -> GTA
-seq1,4,4,5,FIX,.,.,replace T with N -> GNA
-seq2,1,16,16,EXCLUDE,.,.,drop seq2
-seq3,1,2,2,INFO,.,.,drop - too short (will test with min_seq_len=3)
-seq4,1,4,4,INFO,.,.,preserve
-)", ",", "\t")};
+    auto actions_istr = std::stringstream{"##[[\"FCS genome report\", 2, 1]]" + str::replace(R"(
+seq1|1|2|5|TRIM|.|.|trim AC fram ACGTA -> GTA
+seq1|4|4|5|FIX|.|.|replace T with N -> GNA
+seq2|1|16|16|EXCLUDE|.|.|drop seq2
+seq3|1|2|2|INFO|.|.|drop - too short (will test with min_seq_len=3)
+seq4|1|4|4|INFO|.|.|preserve
+seq5|19|ACTION_TRIM|5..9,14..15|split - GP-36138
+)", "|", "\t")};
 
     auto expected_out = std::string{R"(
 >seq1
 GNA
-
 >seq4
 ACGT
-
+>seq5~16..19
+ACGT
+>seq5~10..13
+TGCA
+>seq5~1..4
+ACGT
 )"};
 
     auto ostr = std::stringstream{};
@@ -585,7 +793,7 @@ void gx::GetFasta(const std::string& db_path, std::istream& istr, std::ostream& 
     const auto sbj_infos  = seq_infos_t(ser::from_stream(open_ifstream(db_path)));
     const auto seq_id2oid = make_id2oid_map(sbj_infos);
 
-    const std::string_view mmapped_seq_db = ser::mmap(str::replace(db_path, ".gxi", ".gxs"));
+    const std::string_view mmapped_seq_db = ser::mmap(str::replace_suffix(db_path, ".gxi", ".gxs"));
 
     // input is 3-column locs (seq-id, from1, to1)
     ConsumeMetalineHeader(istr, GX_TSV_HEADER__LOCS);

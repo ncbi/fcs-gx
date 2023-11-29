@@ -36,12 +36,36 @@ using fn::operators::operator%=;
 // NB: as function so we don't get noise on stderr from get_env if it isn't called.
 static size_t s_get_num_cores()
 {
-    static const auto s_num_cores = get_env("GX_NUM_CORES", std::min(32U, std::thread::hardware_concurrency() - 1));
+    static const auto s_num_cores = get_env("GX_NUM_CORES", std::min(48U, std::thread::hardware_concurrency() - 1));
     return s_num_cores;
 }
 
 static const size_t k_fasta_chunk_stride = 1000000UL;
 static const size_t k_fasta_chunk_overlap = 50;
+
+
+void gx::CTmasker::insert(const hmer30_t hmer)
+{
+    auto& dest = m_counts[hmer.w];
+
+    if (dest == k_count_cap) { // don't need to synchronize if already reached the cap
+        return;
+    }
+
+    using lock_t = std::mutex;
+    static std::array<lock_t, 4096> s_mutexes; // to minimize contention; size determined empirically.
+    const std::lock_guard<lock_t> lg{ s_mutexes[hmer.w % s_mutexes.size()] };
+#if 1
+    dest = uint8_t(dest + (dest < k_count_cap));
+#else
+    // if we wanted to count the flip-instanecs only
+    if (dest.flipped != hmer.is_flipped) {
+        dest.flipped = hmer.is_flipped;
+        dest.val = uint8_t(dest.val + (dest.val < 100)); // NB: using 7 bits, so can't exceed 128
+    }
+#endif
+}
+
 
 gx::CTmasker::CTmasker(std::istream& fasta_istr1)
 {
@@ -53,17 +77,13 @@ gx::CTmasker::CTmasker(std::istream& fasta_istr1)
 
     const auto fill_index_from_chunk = [&](fasta_seq_t inp_chunk)
     {
-        const auto bits = bool_na_view_t{ inp_chunk.seq };
-        auto buf = skip_mod3_buf_t::init_from(bits, CTmasker::k_word_tlen, 0);
         size_t last_N_pos = -1;
 
-        for (const auto i : irange{ CTmasker::k_word_tlen, bits.size()}) {
-            buf <<= bits[i];
-
-            if (inp_chunk.seq[i] == 'N' || inp_chunk.seq[i] == 'n') {
-                last_N_pos = i;
-            } else if (i > last_N_pos + CTmasker::k_word_tlen) {
-                this->insert(CTmasker::minword30_t{ buf });
+        for (auto kmer = kmer_ci_t(inp_chunk.seq, CTmasker::k_word_tlen); kmer; ++kmer) {
+            if (inp_chunk.seq[kmer.i] == 'N' || inp_chunk.seq[kmer.i] == 'n') {
+                last_N_pos = kmer.i;
+            } else if (kmer.i > last_N_pos + CTmasker::k_word_tlen) {
+                this->insert(CTmasker::hmer30_t{ kmer.buf });
             }
         }
         return inp_chunk;
@@ -181,23 +201,19 @@ gx::ivls_t gx::CTmasker::find_repeats(const iupacna_seq_t& seq) const
     static const float  min_repeat_sup_factor = get_env("GX_TMASKER_MIN_REPEAT_SUP_FACTOR", 30.0f);
     static const size_t min_repeat_sup_cutoff = get_env("GX_TMASKER_MIN_REPEAT_SUP_CUTOFF", 50ul);
     const size_t min_repeat_sup = std::min(min_repeat_sup_cutoff, size_t(m_baseline * min_repeat_sup_factor));
-    VERIFY(min_repeat_sup <= 250); // because m_counts are capped
+    VERIFY(min_repeat_sup <= k_count_cap); // because m_counts are capped
 
     static const auto min_repeat_len = get_env("GX_TMASKER_MIN_REPEAT_LEN", 100);
     VERIFY(min_repeat_len >= CTmasker::k_word_tlen);
 
-    const auto bits = bool_na_view_t{ seq };
-    auto buf = skip_mod3_buf_t::init_from(bits, CTmasker::k_word_tlen, 0);
     auto ivls = ivls_t{};
-
-    for (const auto i : irange{ CTmasker::k_word_tlen, bits.size() }) {
-        buf <<= bits[i];
-
-        if (this->at(buf) < min_repeat_sup) {
+#if 1
+    for (auto kmer = kmer_ci_t(seq, CTmasker::k_word_tlen); kmer; ++kmer) {
+        if (this->at(kmer.buf) < min_repeat_sup) {
             continue;
         }
 
-        const auto ivl = ivl_t{ pos1_t(i + 2 - CTmasker::k_word_tlen), CTmasker::k_word_tlen };
+        const auto ivl = ivl_t{ pos1_t(kmer.i + 2 - CTmasker::k_word_tlen), CTmasker::k_word_tlen };
         // +1 to convert stop-pos to end-pos;
         // +1 to make 1-based;
         // -k_word_tlen to convert to start-pos
@@ -234,6 +250,41 @@ gx::ivls_t gx::CTmasker::find_repeats(const iupacna_seq_t& seq) const
         ivls[i-1] = ivl_t{};
     }
 
+#else // experimental
+    size_t last_N_pos = 0;
+    
+    static thread_local std::vector<uint32_t> ccounts{}; // cumulative counts
+    ccounts.resize(seq.size());
+
+    for (auto kmer = kmer_ci_t(seq, CTmasker::k_word_tlen); kmer; ++kmer) {
+        if (seq.at(kmer.i) == 'N' || seq.at(kmer.i) == 'n') {
+            last_N_pos = kmer.i;
+        }
+
+        ccounts[kmer.i] = ccounts[kmer.i - 1] + (kmer.i < last_N_pos + CTmasker::k_word_tlen ? 0 : this->at(kmer.buf));
+        VERIFY(ccounts[kmer.i - 1] < ccounts[kmer.i]);
+    }
+
+    for (size_t i = min_repeat_len; i < seq.size(); ++i) {
+        const double n = double(ccounts[i] - ccounts[i - min_repeat_len]) / double(min_repeat_len);
+
+        if (n < min_repeat_sup) {
+            continue;
+        }
+
+        const auto ivl = ivl_t{ pos1_t(i + 2 - min_repeat_len), min_repeat_len };
+        // +1 to convert stop-pos to end-pos;
+        // +1 to make 1-based;
+        // -k_word_tlen to convert to start-pos
+
+        // merge if high-overlap (i.e. avoid merging suprious at this stage)
+        if (!ivls.empty() && ivls.back().endpos() >= ivl.pos) {
+            ivls.back().len = ivl.endpos() - ivls.back().pos;
+        } else {
+            ivls.push_back(ivl);
+        }
+    }
+#endif
     ivls %= fn::where L(_.len > min_repeat_len);
 
     return ivls;

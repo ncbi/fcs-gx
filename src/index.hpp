@@ -29,37 +29,46 @@
 namespace gx
 {
 
-
-// todo: if we maintain counts on-line while indexing, we can
-// insert a value into the bucket in O(1) with up-to 16 swaps.
-// Can use the upper bits for extra 4-bits of key.
-// I.e. use 30-bits for addressing into the main table, another
-// four bits for addressing into the subbucket, and carry four
-// bits in MSBs of value (will need to use 32-bit counters).
-
-// Index 60-bit values using 38-bit key.
-//
-// For our purposes the 38-bit key is a word, or rather a hash of a fingerprint
-// from a window in a dna sequence, value is a seq-id (28-bit id-ordinal + 32-bit position)
 class CIndex
 {
 public:
-    // 38-bit oriented word, selected as min(w, rev_comp(w))h
-    struct minword38_t
+    struct hmer38_t : public hmer_t<uint64_t, 38>
     {
-        minword38_t() : w(0), is_flipped(0)
-        {}
-
-        minword38_t(const skip_mod3_buf_t& b)
+        hmer38_t(uint64_t buf)
+            : hmer_t<uint64_t, 38>(buf)
         {
-            uint64_t buf = b.get();
-            buf &= Ob1x(38);
+#if 0
+            // Experimental
+            //
+            // Find min hash-neighbor within 1-bit edit-distance.
+            // If w is already hash-minimal in the neighborhood, we're done.
+            // Otherwise change w to the neighbor and try again.
+            //
+            // I.e. transitively reach local hash-minimal neighbor.
 
-            // Select orientation.
-            auto flipped_buf = revcomp_bits(buf, 38); // number of bits in the mask
-            this->is_flipped = flipped_buf < buf;
-            this->w = is_flipped ? flipped_buf : buf;
+            static const auto s_enable_hmer_grouping = get_env("GX_ENABLE_HMER_GROUPING", false);
 
+            if (s_enable_hmer_grouping)
+                while (true)
+            {
+                auto best = std::make_pair(w, uint64_hash(w));
+
+                for (size_t i = 0; i < 38; i++) {
+                    const auto modified_w = w ^ (1ULL << i);
+                    const auto h = uint64_hash(modified_w);
+
+                    if (h < best.second) {
+                        best = std::make_pair(modified_w, h);
+                    }
+                }
+
+                if (best.first == w) {
+                    break;
+                } else {
+                    w = best.first;
+                }
+            }
+#endif
             // Rotate the bits to put the middle bits in LSBs, such that the subkey
             // is determined by bits from the middle of the word rather than the end,
             // so that if we ignore subkey when we need sensitivity boost, we don't
@@ -68,32 +77,22 @@ public:
               | ((w & 0b11111111111111111111111000000000000000) >> 15); //(38-(15+8))
             //                         ^^^^^^^^ // subkey will be constructed from these positions
         }
-
-        uint64_t w;
-        bool is_flipped;
     };
 
     static constexpr int k_word_tlen = 38 / 2 * 3 - 1; // template: 0b11011011011011011011011011011011011011011011011011011011
-                                    // ^^         - bitwidth of minword38_t above
+                                    // ^^         - bitwidth of hmer38_t above
                                     // ^^^^^^     - number of codons
                                     // ^^^^^^^^^^ - number of bases
                                     //            ^^^ exclude last codon's third position to make the template symmetric (reverse-complementable)
 
-    // convert inclusive 0-based positional stop-pos of a word
-    static inline pos1_t make_word_start_pos1(size_t stop_pos, bool is_flipped)
-    {
-        return is_flipped ? (int32_t(stop_pos) + 1) * -1
-                          : (int32_t(stop_pos) + 1) + 1 - k_word_tlen;
-    }
-
-    static const uint8_t k_stride = 10;
+    static const uint8_t k_stride = 11;
     static_assert(k_stride % 3 != 0, ""); // so that we sample coding words in all three phases
 
     struct node_t
     {
-          seq_oid_t seq_oid;
-             pos1_t pos;
-            uint8_t subkey8; // will use std::equal_range to locate within sub-bucket.
+          seq_oid_t seq_oid; // subject-seq-id of indexed h-mer
+             pos1_t pos;     // position of indexed h-mer
+            uint8_t subkey8; // lower bits of the hmer38_t::w - will use std::equal_range to locate within sub-bucket.
 
         bool operator<(const node_t& other) const
         {
@@ -109,33 +108,11 @@ public:
                 &&           pos == other.pos;
         }
     } __attribute__((packed));
-    using nodes_t = std::vector<node_t>;
-
-
     static_assert(sizeof(node_t) == 9, "");
 
-    /////////////////////////////////////////////////////////////////////////
 
-    struct nodes_view_t
-    {
-        const node_t* b = nullptr;
-        const node_t* e = nullptr;
-
-        const node_t* begin() const
-        {
-            return b;
-        }
-
-        const node_t* end() const
-        {
-            return e;
-        }
-
-        size_t size() const
-        {
-            return size_t(e - b);
-        }
-    };
+    using nodes_t      = std::vector<node_t>;
+    using nodes_view_t = fn::view<const node_t*>;
 
 public:
     ///////////////////////////////////////////////////////////////////
@@ -144,7 +121,7 @@ public:
     {
         const auto scope_guard = make_exception_scope_guard([&]
         {
-            std::cerr << "NB: Not enough RAM. Require 24GiB + 1 byte/bp.\n";
+            std::cerr << "NB: Not enough RAM for creating gx-db. Require 24GiB + 1 byte/bp.\n";
         });
 
         m_buckets.resize(k_num_buckets);
@@ -162,12 +139,12 @@ public:
     void from_stream(std::istream& istr);
 
     /////////////////////////////////////////////////////////////////////////
-    // the pos1 is expected to be negative iff minword is flipped
-    void insert(const minword38_t minword, seq_oid_t seq_oid, pos1_t pos);
+    // the pos1 is expected to be negative iff hmer is flipped
+    void insert(const hmer38_t hmer, seq_oid_t seq_oid, pos1_t pos);
 
     void finalize(const seq_infos_t&);
 
-    nodes_view_t at(minword38_t) const;
+    nodes_view_t at(hmer38_t) const;
     /////////////////////////////////////////////////////////////////////////
 
 private:

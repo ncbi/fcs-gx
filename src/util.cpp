@@ -31,6 +31,8 @@
 
 // for rusage
 #include <unistd.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 
 // for mmap
 #include <fcntl.h>
@@ -51,19 +53,50 @@ uint64_t gx::revcomp_bits(uint64_t w, uint8_t num_bits)
     static const uint64_t k1  = 0x5555555555555555UL;
     static const uint64_t k2  = 0x3333333333333333UL;
     static const uint64_t k4  = 0x0F0F0F0F0F0F0F0FUL;
-    static const uint64_t k8  = 0x00FF00FF00FF00FFUL;
-    static const uint64_t k16 = 0x0000FFFF0000FFFFUL;
 
-    // reverse bits
-    w = ((w >>  1) & k1)  | ((w & k1)  <<  1); // swap bit-bits
+    w = ((w >>  1) & k1)  | ((w & k1)  <<  1); // swap adjacent bits
     w = ((w >>  2) & k2)  | ((w & k2)  <<  2); // swap bit-pairs
     w = ((w >>  4) & k4)  | ((w & k4)  <<  4); // swap nibbles
-    w = ((w >>  8) & k8)  | ((w & k8)  <<  8); // swap single bytes
-    w = ((w >> 16) & k16) | ((w & k16) << 16); // swap 2-byte frames
-    w = ((w >> 32)      ) | ((w      ) << 32); // swap 4-byte frames
+
+#if defined(__GNUC__)
+    w = __builtin_bswap64(w);
+#elif defined(_MSC_VER)
+    w = _byteswap_uint64(w);
+#else
+    static const uint64_t k8  = 0x00FF00FF00FF00FFUL;
+    static const uint64_t k16 = 0x0000FFFF0000FFFFUL;
+    w = (( w >>  8 ) & k8  ) | (( w & k8  ) <<  8 ); // swap single bytes
+    w = (( w >> 16 ) & k16 ) | (( w & k16 ) << 16 ); // swap 2-byte frames
+    w = (( w >> 32 )       ) | (( w       ) << 32 ); // swap 4-byte frames
+#endif
 
     return ~w >> (64 - num_bits); // flip the bits and shift into lsbs.
 }
+
+uint64_t gx::drop_every_3rd_bit(uint64_t w)
+{
+    static const uint64_t k1 = 0b0011000011000011000011000011000011000011000011000011000011000011;
+    static const uint64_t k2 = 0b1111000000001111000000001111000000001111000000001111000000001111;
+    static const uint64_t k3 = 0b0000000011111111000000000000000011111111000000000000000011111111;
+    static const uint64_t k4 = 0b1111111111111111000000000000000000000000000000001111111111111111;
+    static const uint64_t k5 = 0b0000000000000000000000000000000011111111111111111111111111111111;
+
+    w = (w & k1) | ((w & (k1 <<  3)) >>  1);
+    w = (w & k2) | ((w & (k2 <<  6)) >>  2);
+    w = (w & k3) | ((w & (k3 << 12)) >>  4);
+    w = (w & k4) | ((w & (k4 << 24)) >>  8);
+    w = (w & k5) | ((w & (k5 << 48)) >> 16);
+    return w;
+}
+
+static const bool test_drop_every_3rd_bit = []
+{
+    uint64_t x1  = 0b1011010110100010111000110101010111101001001111000110100001010010;
+    uint64_t y1e = 0b1'11'10'10'00'10'11'00'10'01'10'11'01'01'01'11'00'10'00'01'10'10;
+    uint64_t y1a = drop_every_3rd_bit(x1);
+    VERIFY(y1a == y1e);
+    return true;
+}();
 
 
 /////////////////////////////////////////////////////////////////////////////
@@ -101,8 +134,29 @@ void ser::prefetch_mmapped_pages(const std::string& filename, std::string_view s
 
     auto get_pct_pages_in_core = [&]
     {
-        VERIFY(0 == mincore(const_cast<char*>(sv.data()), sv.size(), is_resident.data()));
-        return std::count_if(is_resident.begin(), is_resident.end(), L(_ != 0)) * 100 / num_pages;
+        const auto get_rusage = []
+        {
+            rusage r{};
+            getrusage(RUSAGE_SELF, &r);
+            return r;
+        };
+
+        // mincore call is slow (up to 15 seconds even if all pages are in-core),
+        // so first do a quick estimate accessing a random sample of pages and 
+        // checking if the process had any page-faults.        
+        const auto ru_before = get_rusage();
+        const auto rand_seed = static_cast<uint64_t>( time(NULL) );
+        volatile size_t pos = 0; // prevent from optimizing-out
+        for(size_t i = 0; i < 100; i++) {
+            pos = uint64_hash(rand_seed ^ i ^ (uint64_t(sv[pos]) << 32) ) % sv.size();
+        }
+
+        if (get_rusage().ru_majflt == ru_before.ru_majflt) {
+            return 100ul; // assume 100% in-core
+        } else {
+            VERIFY(0 == mincore(const_cast<char*>(sv.data()), sv.size(), is_resident.data()));
+            return std::count_if(is_resident.begin(), is_resident.end(), L(_ != 0)) * 100 / num_pages;
+        }
     };
 
     auto pct_pages_in_core = get_pct_pages_in_core();
@@ -179,6 +233,13 @@ tax_map_t gx::LoadTaxa(std::istream* istr)
             taxon.gx_taxdiv = "synt:synthetic"; // temporary work-around to support older gxdbs. GP-34646
         }
 
+        // GP-31064
+        // Strip "our" suffixes that are sequence-specific, not taxon-specific.
+        static const auto suffixes = std::vector<std::string>{{", mitochondrion", ", plastid", ", plasmid"}};
+        for (const auto& suffix : suffixes) {
+            taxon.species = str::replace_suffix(std::move(taxon.species), suffix, "");
+        }
+
         ret[tax_id] = taxon;
         gx_taxdivs.push_back(taxon.gx_taxdiv);
         VERIFY(gx_taxdivs.back() != "NULL");
@@ -228,8 +289,8 @@ std::string gx::ConsumeMetalineHeader(std::istream& istr, std::string header)
 
     std::string line;
     std::getline(istr, line);
-    header = str::replace_all(header, ", ", ",");
-    line   = str::replace_all(line, ", ", ",");
+    header = str::replace(header, ", ", ",");
+    line   = str::replace(line, ", ", ",");
 
     if (!str::startswith(line, header)) {
         GX_THROW("Expected the first line of the input file to begin with header: \n" + header + "\nfound: \n" + line + "\n");

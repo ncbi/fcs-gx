@@ -22,6 +22,8 @@
 
 -----------------------------------------------------------------------------
 """
+# pylint: disable=C0301,C0302,C0114,C0103,C0116,C0115,R0913,R0914,R0915,R0916,R0911,W0702,W0603,R1732
+# fmt: off
 
 import sys
 assert sys.version_info.major >= 3 and sys.version_info.minor >= 8, f"Python version: {sys.version_info}. Require python 3.8 or newer."
@@ -37,12 +39,16 @@ import time
 import json
 import glob
 import urllib.request
+import platform
+import uuid
+import random
+import functools
 
-from typing import Tuple
-
+from contextlib  import suppress
+from typing      import Tuple
 from collections import defaultdict
 from collections import namedtuple
-from pathlib import Path
+from pathlib     import Path
 
 # Execute gx-pipeline:
 # python3 run_gx.py
@@ -52,8 +58,77 @@ from pathlib import Path
 #   --split-fasta=T
 #   --out-dir=.
 
-horizontal_line = "\n--------------------------------------------------------------------\n"
+# ---------------------------------------------------------------------------
+def get_gx_build_str(args, just_semver=False) -> str:
+    """ 
+        Get the GX software version from the output of `gx --help`
 
+        E.g. "Oct 26 2023 13:47:25; git:v0.4.0-210-g35dc81ce"
+        If just_semver=True, then just the semver part, e.g. "0.4.0-210-g35dc81ce"
+    """
+    gx_help = subprocess.run(
+        [f"{args.bin_dir}/gx", "--help"],
+        check=True, shell=False, capture_output=True, encoding="ascii"
+    )
+    gx_build = [line[6:] for line in gx_help.stdout.split("\n") if line.startswith("build:")][0].strip()
+    semver = re.search(r"\bgit:v?(\S+)", gx_build).group(1)
+    return semver if just_semver else gx_build
+
+
+# ---------------------------------------------------------------------------
+def send_analytics(args, start_time, is_success=True):
+    """ Report analytics to NCBI. GP-36549 """
+
+    if not args.phone_home_label:
+        return
+
+    gxdb_dir = os.path.dirname(args.gx_db) if args.gx_db.endswith(".gxi") else args.gx_db
+
+    gxdb_build_date = next(iter(set((
+        json.load(open(f"{d}/{f}", encoding="UTF-8"))["build-date"]
+        for d in [gxdb_dir] for f in os.listdir(gxdb_dir)
+        if f.endswith(".meta.jsonl") and os.path.exists(d + "/" + f.replace(".meta.jsonl", ".gxi"))
+    ))), "NA")
+
+    # NB: Same params as in fcs.py, and additional ncbi_label
+    url_args = {
+        "ncbi_app"              : "fcs",     # To be consistent with the pings from fcs.py
+        "ncbi_mode"             : "screen",  # ... as above.
+        "ncbi_op"               : "genome",  # ... as above.
+        "sgversion"             : get_gx_build_str(args, just_semver=True),
+        "ncbi_gxdb"             : gxdb_build_date,
+        "ncbi_architecture"     : platform.platform(),
+        "ncbi_python_version"   : sys.version.split()[0],
+        "ncbi_container_engine" : "NA",
+        "ncbi_mem_gib"          : os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 1024**3,
+        "ncbi_duration"         : int(time.time() - start_time + 0.5),
+        "ncbi_exit_status"      : 0 if is_success else 1,
+        "ncbi_label"            : args.phone_home_label
+    }
+
+    url = "https://www.ncbi.nlm.nih.gov/stat?" + urllib.parse.urlencode(url_args)
+
+    if args.debug:
+        eprint("Not sending analytics in debug-mode:", url)
+    else:
+        with suppress(Exception):  # e.g. no internet access
+            urllib.request.urlopen(url)
+
+
+# ---------------------------------------------------------------------------
+horizontal_line = "\n-----------------------------------------------------------------------------\n"
+
+
+def excepthook(etype, value, tb):
+    # If an exception is in a called-script, e.g. classify_taxonomy.py,
+    # then the stdout will have two stack-traces printed one after the other
+    # (one from classify_taxonomy.py, followed by the ours), which the error
+    # messages sandwiched between them, making it visually "buried".
+    # So we print a horizontal line before printing our stack-trace so that
+    # it's visually separated from previous stack-traces and/or messages.
+    print(horizontal_line, file=sys.stderr)
+    sys.__excepthook__(etype, value, tb)
+sys.excepthook = excepthook
 
 # ---------------------------------------------------------------------------
 def eprint(*args):
@@ -63,14 +138,6 @@ def eprint(*args):
 # ---------------------------------------------------------------------------
 g_verbose = False
 g_use_color = bool(os.getenv("FCS_USE_COLOR"))
-
-
-# Will print exception-text underlined, and in red if using colors
-def excepthook(etype, value, tb):
-    msg = "\033[4m" + ("\033[91m" if g_use_color else "") + str(value) + "\033[0m" + "\n"
-    sys.__excepthook__(etype, etype(msg), tb)
-
-sys.excepthook = excepthook
 
 
 def debug_print(*args):
@@ -84,13 +151,15 @@ def debug_print(*args):
 
 def with_this_py(args):
     # args[0] may be a bazel executable (without .py), or a python script (with .py)
-    # If the latter, execute it with same python3 binary as this script, 
+    # If the latter, execute it with same python3 binary as this script,
     # in case the user invoked it with a specific python path, overriding shebang.
     if os.path.exists(args[0] + ".py"):
         args[0] += ".py"
 
     if args[0].endswith(".py"):
         args = [sys.executable] + args
+
+    debug_print(args)
 
     return args
 
@@ -163,11 +232,11 @@ class ProcessPipeline:
 
         if out_filename:
             assert not self.out_file, "Already have terminal stage with output-file."
-            self.out_file = open(out_filename, "wb")  # pylint: disable=R1732
+            self.out_file = open(out_filename, "wb")
 
         fds = tuple(int(fd) for fd in re.findall(r"\W/dev/fd/(\d+)", str(cmd)))
 
-        p = subprocess.Popen(  # pylint: disable=R1732
+        p = subprocess.Popen(
             shlex.split(cmd) if isinstance(cmd, str) else cmd,
             stdout=self.out_file if self.out_file else subprocess.PIPE,
             stdin=(stdin if stdin else self.processes[-1].p.stdout if self.processes else None),
@@ -239,6 +308,58 @@ class ProcessPipeline:
 
 
 # ---------------------------------------------------------------------------
+def retry_on_exception(num_tries, wait_time):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for i in range(num_tries):
+                try:
+                    return func(*args, **kwargs)
+                except:
+                    if i == num_tries - 1:
+                        raise
+                    eprint(f"Call to {func}({args}, {kwargs}) failed; Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+            return None  # silence, pylint!
+        return wrapper
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+def rate_limited(function, wait_time=0.5):
+    """
+    Rate-limit invocations of the wrapped function across the multiple instances
+    of a program running on the same host.
+
+    Will apply it to functions calling eutils, as otherwise they're prone to erroring-out.
+    """
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        # Will track the last invocation time using a shared file in /tmp/
+        appname  = os.path.basename(__file__)
+        filename = f"/tmp/{appname}.{function.__module__}.{function.__name__}.ratelimiter"
+        printed  = False
+
+        while True:  # Wait for our turn
+            if not os.path.exists(filename) or time.time() - os.path.getmtime(filename) > wait_time:
+                with open(filename, 'a', encoding="ascii"):  # Touch the file
+                    os.utime(filename, None)
+
+                os.chmod(filename, 0o666)  # Make everyone-writeable
+                return function(*args, **kwargs)
+
+            if not printed:
+                printed = True
+                debug_print("API rate-limiting in effect - waiting to touch", filename, "...")
+
+            time.sleep(random.uniform(0, wait_time / 2))
+
+
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+@retry_on_exception(num_tries=3, wait_time=5)
+@rate_limited
 def get_json(url):
     with urllib.request.urlopen(url, timeout=10) as r:
         assert r.status == 200, f"Error: {url} - status {r.status}."
@@ -265,34 +386,47 @@ def get_tax_id_from_species(species):
         return None
 
     sp = urllib.parse.quote(species)
-    j = get_json(f"{eutils_url}/esearch.fcgi?db=taxonomy&format=json&term={sp}%5Bporgn%5D")
+    j = get_json(f"{eutils_url}/esearch.fcgi?db=taxonomy&format=json&term={sp}")
     assert len(j["esearchresult"]["idlist"]) == 1, f"Did find unique tax-id for '{species}'"
     return int(j["esearchresult"]["idlist"][0])
 
 
 # ---------------------------------------------------------------------------
 def redirect_stdout_stderr_to_file(args) -> None:
-    pid = os.getpid()
-    filename = f"{args.out_dir}/tmp_{pid}.summary.txt"
-    sys.stdout = open(filename, 'w')
+    # NB: Using uuid4 instead of PID for temporary file-name,
+    # since this may be running in different instances of
+    # a container, with colliding PIDs. GP-36550
+    filename = f"{args.out_dir}/tmp_{uuid.uuid4()}.summary.txt"
+    sys.stdout = open(filename, 'w', encoding="ascii")
     sys.stderr = sys.stdout
     return filename
 
 
 # ---------------------------------------------------------------------------
 def guess_assembly_path(gc_acc: str, gc_genomes_root_dir: str):
-    ps = [p for p in Path("/").glob(gc_genomes_root_dir.strip("/") + f"*/all/{gc_acc[0:3]}/{gc_acc[4:7]}/{gc_acc[7:10]}/{gc_acc[10:13]}/{gc_acc}_*/{gc_acc}_*_genomic.fna.gz") if "_cds_from_" not in str(p) and "_rna_from_" not in str(p)]
+    gc_genomes_root_dir = gc_genomes_root_dir.rstrip("/")
+
+    # prime the automounter so that path expansion in the glob below works
+    assert sum((os.path.exists(f"{gc_genomes_root_dir}" + (f"{n}/" if n > 1 else "/")) for n in range(1, 5))) >= 3  # pylint: disable=W0106
+
+    pattern = gc_genomes_root_dir.lstrip("/") + f"*/all/{gc_acc[0:3]}/{gc_acc[4:7]}/{gc_acc[7:10]}/{gc_acc[10:13]}/{gc_acc}_*/{gc_acc}_*_genomic.fna.gz"
+    ps = [p for p in Path("/").glob(pattern) if "_cds_from_" not in str(p) and "_rna_from_" not in str(p)]
+
+    if len(ps) != 1:
+        eprint(f"Warning: Could not infer assembly-path with /{pattern}")
+
     return str(ps[0]) if len(ps) == 1 else None
 
 
 # ---------------------------------------------------------------------------
-# Get (tax_id, detailed-basename, ftp-fasta-path) from Eutils Assembly summary.
+# Get (tax_id, species-name, detailed-basename, ftp-fasta-path) from Eutils Assembly summary.
 # e.g. (
 #   8407,
+#   "Rana temporaria",
 #   "GCF_905171775.1__8407__Rana_temporaria__common_frog",
 #   "ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/003/330/725/GCF_003330725.1_ASM333072v1/GCF_003330725.1_ASM333072v1_genomic.fna.gz" pylint: disable=C0301
 # )
-def get_taxid__basename__ftp_path(gc_acc: str, gc_genomes_root_dir: str) -> tuple:
+def get_taxid__species__basename__ftp_path(gc_acc: str, gc_genomes_root_dir: str) -> tuple:
     asm_info = get_assembly_esummary(gc_acc)
     tax_id = int(asm_info["taxid"])
 
@@ -302,7 +436,8 @@ def get_taxid__basename__ftp_path(gc_acc: str, gc_genomes_root_dir: str) -> tupl
 
     # NB: Do not use asm_info["ftppath_assembly_rpt"] - see GP-33326
     ftp_path = asm_info["ftppath_genbank" if gc_acc.startswith("GCA_") else "ftppath_refseq"]
-    assert ftp_path, "No FTP path for this assembly."
+
+    assert ftp_path, "No FTP path in esummary for this assembly."
     assert not ftp_path.endswith("/")
     ftp_path += "/" + ftp_path.split("/")[-1] + "_genomic.fna.gz"
 
@@ -319,7 +454,7 @@ def get_taxid__basename__ftp_path(gc_acc: str, gc_genomes_root_dir: str) -> tupl
             # Don't assert here; just warn - will fall-back on guess_assembly_path in the caller code.
             eprint(f"Can't resolve fasta path from FTP path {paths}")
 
-    return (tax_id, f"{gc_acc}__{tax_id}__{org}", ftp_path)
+    return (tax_id, asm_info["speciesname"], f"{gc_acc}__{tax_id}__{org}", ftp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -393,27 +528,28 @@ def fill_missing_args(args) -> None:
 
     # -----------------------------------------------------------------------
     # Fill-in missing args computable from gc-acc.
-    (gc_tax_id, gc_basename, gc_ftp_fasta_path) = (
-        get_taxid__basename__ftp_path(args.gc_acc, args.gc_genomes_root_dir)
-        if args.gc_acc and not (args.out_basename and args.tax_id and args.fasta)
-        else (None, None, None)
-    )
+    try:
+        (gc_tax_id, gc_species, gc_basename, gc_ftp_fasta_path) = (
+            get_taxid__species__basename__ftp_path(args.gc_acc, args.gc_genomes_root_dir)
+            if args.gc_acc and not (args.tax_id and args.fasta)
+            else (None, None, None, None)
+        )
+    except:
+        eprint("\nError: Call to Eutils failed.\nNote: the following args must be specified to skip the call to Eutils: --tax-id --fasta")
+        raise
 
-    species_tax_id = get_tax_id_from_species(args.species)
+    args.species = args.species or gc_species
 
-    args.tax_id = args.tax_id or gc_tax_id or species_tax_id
-    assert args.tax_id, "--species or --tax-id or --gc-acc must be provided."
+    args.tax_id = args.tax_id or gc_tax_id or get_tax_id_from_species(args.species)
+    assert args.tax_id, "Could not resolve tax-id. --tax-id or --species or --gc-acc must be provided."
 
     # if derived tax-id by multiple means, verify that values are consistent
-    assert not gc_tax_id      or gc_tax_id      == args.tax_id, (gc_tax_id, args.tax_id)
-    assert not species_tax_id or species_tax_id == args.tax_id, (species_tax_id, args.tax_id)
+    assert not gc_tax_id or gc_tax_id == args.tax_id, (gc_tax_id, args.tax_id)
 
     args.fasta = args.fasta or gc_ftp_fasta_path
     assert args.fasta and (
         args.fasta.startswith("ftp://") or Path(args.fasta).exists()  # not is_file() - can be /dev/stdin
     ), "--fasta or --gc-genomes-root-dir and --gc-acc must be provided."
-
-    args.out_basename = args.out_basename or gc_basename
 
     eprint(horizontal_line)
     eprint("tax-id    :", args.tax_id)
@@ -433,6 +569,10 @@ def fill_missing_args(args) -> None:
         gx_div = None
         with open(f"{args.bin_dir}/blast_names_mapping.tsv", "rt", encoding="ascii") as f:
             gx_div = next((line.rstrip().split("\t")[1] for line in f if line.startswith(args.div + "\t")), None)
+
+        # Workaround for renamed blast-div to work with existing gx-db. GP-36251
+        if args.div == "sharks & rays":
+            gx_div = "anml:fishes"
 
         if not gx_div:
             eprint(f">>>>>> Warning: Taxonomy div '{args.div}' is not known to GX. using 'unknown'.")
@@ -458,17 +598,13 @@ def fill_missing_args(args) -> None:
     # -----------------------------------------------------------------------
     # Construct out_basename, if not provided, and prefix out_dir.
     assert args.fasta != "/dev/stdin" or args.out_basename, "--out-basename must be specified."
-    args.out_basename = args.out_basename or re.sub(r"\.\w+$", f".{args.tax_id}", Path(args.fasta).name)
+    args.out_basename = args.out_basename or gc_basename or re.sub(r"\.\w+$", f".{args.tax_id}", Path(args.fasta).name)
     args.out_basename = f"{args.out_dir}/{args.out_basename}"
 
     args.out_taxonomy_rpt = f"{args.out_basename}.taxonomy.rpt"
     eprint("bin-dir   :", args.bin_dir)
     eprint("gx-db     :", args.gx_db)
-
-    gx_help = subprocess.run([f"{args.bin_dir}/gx", "--help"], check=True, capture_output=True, encoding="ascii")
-    gx_version = [line[6:] for line in gx_help.stdout.split("\n") if line.startswith("build:")][0].strip()
-    eprint("gx-ver    :", gx_version)
-
+    eprint("gx-ver    :", get_gx_build_str(args))
     eprint("output    :", args.out_taxonomy_rpt)
 
     eprint(horizontal_line)
@@ -489,10 +625,13 @@ def fill_missing_args(args) -> None:
 #    /path/to/gx taxify --db=/path/to/gxdb/all.gxi -o $out_basename.taxonomy.rpt.tmp
 def run_gx_pipeline(args) -> None:
     def add_zcat_fasta(p):
-        p.add(["gzip", "-cdf", args.fasta])
+        p.add(["cat", args.fasta])
+        p.add(["minigzip", "-d"] if shutil.which("minigzip") else ["gzip", "-cdf"])
+
         if args.fasta.endswith(".mft"):
             p.add(["grep", "-Ev", "^(#|$)"])
-            p.add(["xargs", "-n1", "gzip", "-cdf"])
+            p.add(["xargs", "-n1", "cat"])
+            p.add(["minigzip", "-d"] if shutil.which("minigzip") else ["gzip", "-cdf"])
 
     def run(p_zcat_fasta, p_save_hits, p_main):
         Path(args.out_dir).mkdir(parents=True, exist_ok=True)
@@ -549,8 +688,8 @@ def run_gx_pipeline(args) -> None:
 
         p_main.add([
             gx_bin,
-            "taxify", 
-            f"--gx-db={args.gx_db}", 
+            "taxify",
+            f"--gx-db={args.gx_db}",
             f"--output={args.out_taxonomy_rpt}.tmp",
             f"--asserted-div={args.div}",
         ] + [f"--db-exclude-locs={path}" for path in (os.getenv("GX_EXCLUDE_LOCS", f"{args.bin_dir}/db_exclude.locs.tsv"),) if os.path.exists(path)])  # GP-34552
@@ -565,19 +704,29 @@ def run_gx_pipeline(args) -> None:
 # ---------------------------------------------------------------------------
 # Run classify_taxonomy and action_report
 def run_classify_taxonomy_and_action_report(args) -> None:
+
     def run(cmd, out_filename):
         with open(out_filename, "wb") as out_file:
             subprocess.run(cmd, stdout=out_file, check=True, stderr=sys.stderr)
 
     run(
-        with_this_py([f"{args.bin_dir}/classify_taxonomy", f"--in={args.out_taxonomy_rpt}.tmp"]),
+        with_this_py([
+            f"{args.bin_dir}/classify_taxonomy",
+            f"--in={args.out_taxonomy_rpt}.tmp",
+            *([f"--species={args.species}"] if args.species else []),
+        ]),
         args.out_taxonomy_rpt,
     )
     os.remove(f"{args.out_taxonomy_rpt}.tmp")
 
     if args.action_report:
         run(
-            with_this_py([f"{args.bin_dir}/action_report", f"--in={args.out_taxonomy_rpt}"]),
+            with_this_py([
+                f"{args.bin_dir}/action_report",
+                f"--in={args.out_taxonomy_rpt}",
+                *(["--ignore-same-kingdom"] if args.ignore_same_kingdom else []),
+                *([f"--production-build-name={args.production_build_name}"] if args.production_build_name else [])
+            ]),
             f"{args.out_basename}.fcs_gx_report.txt",
         )
 
@@ -642,12 +791,13 @@ def parse_args():
     req = parser.add_argument_group("required arguments (if --gc-acc not specified).")
     opt = parser.add_argument_group("optional inputs")
     out = parser.add_argument_group("outputs")
-    other = parser.add_argument_group("other")
+    action_report_group = parser.add_argument_group("forward to action_report.py")
+    other_group = parser.add_argument_group("other")
 
     def str2bool(x):
         ts = ("yes", "true", "t", "y", "1")
         fs = ("no", "false", "f", "n", "0")
-        x = x.lower()
+        x = str(x).lower()
 
         if x in ("none", ""):
             return None
@@ -717,6 +867,7 @@ def parse_args():
     opt.add_argument(
         "--mask-transposons",
         type=str2bool,
+        default=os.getenv("GX_MASK_TRANSPOSONS", default=None),
         metavar="BOOL",
         help="Whether to mask transposons in the input. If not specified, will mask for euks only.",
     )
@@ -751,7 +902,13 @@ def parse_args():
         default=None,
         help="Whether to use same-species hits as evidence.",
     )
-    
+
+    # -----------------------------------------------------------------------
+    # copy-pasted from action_report.py (as a flag, rather than bool param)
+    action_report_group.add_argument("--ignore-same-kingdom", action="store_true")
+    if is_ncbi:
+        action_report_group.add_argument("--production-build-name")
+
     # -----------------------------------------------------------------------
     # Outputs.
 
@@ -772,7 +929,7 @@ def parse_args():
         type=str2bool,
         metavar="BOOL",
         default=True,
-        help="Generate *.fcs_action_report.txt output.",
+        help="Generate *.fcs_gx_report.txt output.",
     )
 
     out.add_argument(
@@ -793,11 +950,18 @@ def parse_args():
 
     # -----------------------------------------------------------------------
 
-    other.add_argument(
+    other_group.add_argument(
         "--debug",
         action="store_true",
         help="Enable verbose mode.",
     )
+
+    other_group.add_argument(
+        "--phone-home-label",
+        type=str,
+        help="Parameter to contact NCBI with minimal information about runs for assessing tool adoption. Please provide a text string such as your institution.",
+    )
+
 
     # print help and error-out if no args are supplied
     if len(sys.argv) == 1:
@@ -811,6 +975,7 @@ def parse_args():
     if not is_ncbi:
         args.gc_acc = None
         args.gc_genomes_root_dir = None
+        args.production_build_name = None
 
     elif not args.gc_genomes_root_dir and args.fasta and args.fasta.startswith("ftp://"):
         eprint(
@@ -844,13 +1009,13 @@ def main() -> None:
     if args.generate_logfile:
         log_file_name = redirect_stdout_stderr_to_file(args)
 
-        # NB1: we are redirecting to a temp-file first because 
+        # NB1: we are redirecting to a temp-file first because
         # basename is computed in fill_missing_args - it is not available here yet.
         # Will rename the file in the end.
-        # 
+        #
         # NB2: The correct way to redirect is described below:
         # https://eli.thegreenplace.net/2015/redirecting-all-kinds-of-stdout-in-python/
-        # 
+        #
         # The simple way should be enough for our purposes.
 
     if not args.gx_db.endswith(".gxi"):
@@ -864,22 +1029,30 @@ def main() -> None:
 
     check_preconditions(args)
     fill_missing_args(args)
-    run_gx_pipeline(args)
-    run_classify_taxonomy_and_action_report(args)
+
+    start_time = time.time()
+    try:
+        run_gx_pipeline(args)
+        run_classify_taxonomy_and_action_report(args)
+    except:
+        send_analytics(args, start_time, is_success=False)
+        raise
+
+    send_analytics(args, start_time, is_success=True)
 
     if args.action_report:
         print_summary(args, "fcs_gx_report.txt", "contamination", 5, (1, 2), lambda cols: cols[6] != "REVIEW" and cols[6] != "REVIEW_RARE")
         print_summary(args, "fcs_gx_report.txt", "action", 4, (1, 2), lambda cols: True)
     else:
         print_summary(args, "taxonomy.rpt", "contamination", 32, (1,), lambda cols: "contaminant" in cols[31])
-    
+
     eprint(horizontal_line)
 
     # now that we have the the basename available, we can rename the log file appropriately
     if args.generate_logfile:
         new_log_file_name =  f"{args.out_basename}.summary.txt"
         os.rename(log_file_name, new_log_file_name)
-        
+
 
 # ---------------------------------------------------------------------------
 

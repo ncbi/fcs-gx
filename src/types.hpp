@@ -208,92 +208,77 @@ struct fasta_seq_t
     static na_t s_complement(na_t);
 };
 
-/////////////////////////////////////////////////////////////////////////////
-// 1-bit reduced-alphabet nucleotide
-enum class bool_na_t : bool { AG=false, CT=true };
-
-struct skip_mod3_buf_t
+// A "cursor" that scans over 1-bit ({CT, AG} alphabet) sequence and maintains the 
+// recently seen bits in a 64-bit buf (current bit in lsb).
+// for (auto kmer = kmer_ci_t(qry.seq, CIndex::k_word_tlen); kmer; ++kmer) { ... }
+template<typename Seq>
+struct kmer_ci_t
 {
-    uint64_t bufs[3] = { 0, 0, 0 };
-    uint8_t phase = 0;
+    const Seq& seq;
+    size_t i = size_t(-1); // 0-based position into seq, corresponding to LSB in buf
+    uint64_t buf = 0;
+    uint64_t m_hash_salt = 0;
 
-    // After pushing the bit into LSB, get() will yield 64-bit word with
-    // every 3rd bit dropped, starting at 3rd LSB
-    //
-    // ....x-xx-xx-xx
-    //      ^  ^  ^  dropped bits
-    //              ^ LSB just-pushed
-    //
-    // // E.g. after pushing bits...
-    // ...1011001110001111000011111 // inputs
-    // ...1-11-01-10-01-11-00-11-11 // every 3rd bit is skipped
-    //         ...11101100111001111 // result
-    void operator<<=(bool_na_t na)
+    kmer_ci_t(Seq&& seq_, size_t prefill_len, size_t offset = 0) = delete; // prevent binding to temporaries
+
+    kmer_ci_t(const Seq& seq_, size_t prefill_len, size_t offset = 0)
+        : seq{ seq_ }
+        , i{ offset - 1 }
+        , m_hash_salt{ uint64_hash(seq.size()) }
     {
-        bufs[0] = (bufs[0] << 1) | (bool)na;
-        bufs[1] = (bufs[1] << 1) | (bool)na;
-        bufs[2] = (bufs[2] << 1) | (bool)na;
-
-        bufs[phase] >>= 1;
-        phase = uint8_t((phase + 1) % 3);
-
-        // after moving to the next phase, the corresponding buf's lowest two bits
-        // contain the last two bits that were pushed.
-        //
-        // static thread_local bool prev_bit = false;
-        // VERIFY((bufs[phase] & 3) == ((uint64_t(prev_bit) << 1) | uint64_t(bit)));
-        // prev_bit = bit;
-    }
-
-    template<typename Seq>
-    static skip_mod3_buf_t init_from(const Seq& seq, size_t len, size_t offset = 0)
-    {
-        static_assert(std::is_same<bool_na_t, decltype(seq[0])>::value, "");
-
-        skip_mod3_buf_t ret{};
-        len = std::min(offset + len, seq.size());
-        for (const auto i : irange{ offset, len }) {
-            ret <<= seq[i];
+        if constexpr (std::is_same_v<Seq, iupacna_seq_t>) {
+            // Hash over the entire seq, as otherwise if we have a sequence
+            // in db of the same length as this, and they both begin with an N-run,
+            // we don't want them pseudorandomized to the same bits, but don't 
+            // do that for non-zero offset cases (dealing with a sub-interval, 
+            // and don't want to hash over the whole seq every time).
+            m_hash_salt ^= offset != 0 ? uint64_hash(offset) : uint64_hash(seq.data(), seq.size());
         }
-        return ret;
+
+        do {
+            ++(*this);
+        } while (i < offset + prefill_len);
     }
 
-    uint64_t get() const
+    explicit operator bool() const
     {
-        return bufs[phase];
-    };
+        return i < seq.size();
+    }
+
+    void operator++()
+    {
+        ++i;
+        buf <<= 1;
+
+        if (i < seq.size()) {
+            const auto na = seq[i];
+            buf |= na == 'C' || na == 'c' || na == 'T' || na == 't' ? 1
+                 : na == 'A' || na == 'a' || na == 'G' || na == 'g' ? 0
+                 : bool(1 & uint64_hash(i ^ m_hash_salt)); // pseudorandomly
+        }
+    }
 };
 
-/////////////////////////////////////////////////////////////////////////////
-struct bool_na_view_t
+
+
+// h-mer: orientation-invariant hmer with coding-template (11-11-...-11) applied
+template<typename UintT, size_t BitWidth>
+struct hmer_t 
 {
-public:
-    bool_na_view_t(const iupacna_seq_t& seq)
-        : m_seq{ seq }
-        , m_hash_salt{ seq.empty() ? 0 : uint64_hash(&seq[0], seq.size()) }
-    {}
+    static_assert(std::is_same_v<UintT, uint64_t> || std::is_same_v<UintT, uint32_t>, "");
+    static_assert(BitWidth <= sizeof(UintT) * 8);
+    static_assert(BitWidth <= 42); // after dropping every third bit from a 64-bit kmer.
 
-    // We could just make the hash-salt based on seq size alone, but that will be a problem
-    // if we have two different seqs of the same size, and they begin with a run
-    // of Ns - we don't want the pseudorandomization of those Ns to be the same.
+    UintT w = 0; 
+    bool is_flipped = false;
 
-    bool_na_t operator[](const size_t i) const
+    hmer_t(uint64_t kmer) // from kmer_ci_t::buf
     {
-        const na_t c = m_seq.at(i);
-        return bool_na_t(
-               c == 'A' || c == 'G' || c == 'a' || c == 'g' ? false
-             : c == 'C' || c == 'T' || c == 'c' || c == 't' ? true
-             : bool(1 & uint64_hash(i ^ m_hash_salt))); // pseudorandomly
+        kmer = drop_every_3rd_bit(kmer) & Ob1x(BitWidth);
+        const auto flipped_kmer = revcomp_bits(kmer, BitWidth);
+        this->is_flipped = flipped_kmer < kmer;
+        this->w = UintT(is_flipped ? flipped_kmer : kmer);
     }
-
-    size_t size() const
-    {
-        return m_seq.size();
-    }
-
-private:
-    const iupacna_seq_t& m_seq;
-    uint64_t m_hash_salt;
 };
 
 } // namespace gx

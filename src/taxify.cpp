@@ -246,13 +246,14 @@ public:
 
         size_t prev_isect_len = 0;
         for (const auto& it : iters)
-            if (it == iters.front()
-                || ( it->cvg_len > 0
-                     && it->gx_taxdiv != "NULL"
-                     && get_kingdom(it->gx_taxdiv) == get_kingdom(iters.front()->gx_taxdiv)
-                     && (it->get_frac() > min_frac)
-                     && (it->top_div_isect_len_nr * 20 > iters.front()->cvg_len_nr
-                         || (double)it->top_div_isect_len_nr > 0.9 * (double)prev_isect_len)
+            if (it->gx_taxdiv != "NULL"
+                && (it == iters.front()
+                    || ( it->cvg_len > 0
+                         && get_kingdom(it->gx_taxdiv) == get_kingdom(iters.front()->gx_taxdiv)
+                         && (it->get_frac() > min_frac)
+                         && (it->top_div_isect_len_nr * 20 > iters.front()->cvg_len_nr
+                             || (double)it->top_div_isect_len_nr > 0.9 * (double)prev_isect_len)
+                       )
                    )
                )
         {
@@ -612,6 +613,7 @@ static void process_ivl(
               const len_t qry_len,
             const ivls_t& collapsed_all_track,
    const repeat_tracks_t& repeat_tracks,
+            const ivls_t& xtrachr_track,
          const tax_map_t& tax_map,
             std::ostream& ostr)
 {
@@ -677,6 +679,7 @@ static void process_ivl(
          << ","  << get_overlap_len(repeat_tracks.low_complexity)
          << ","  << get_overlap_len(repeat_tracks.ultraconserved)
          << ","  << get_overlap_len(repeat_tracks.n_runs)
+         << ","  << get_overlap_len(xtrachr_track)
          << "\t" << get_overlap_len(collapsed_all_track)
          << "\t|";
 
@@ -754,6 +757,7 @@ static void process_qry(
           const seq_id_str_t& qry_id,
                   const len_t qry_len,
              repeat_tracks_t& repeat_tracks,
+                      ivls_t& xtrachr_track,
              const tax_map_t& tax_map,
                  div_stats_t& div_stats,
                 std::ostream& ostr)
@@ -804,6 +808,8 @@ static void process_qry(
     repeat_tracks.ultraconserved = find_ultraconserved_intervals(qry_len, nodes, tax_map);
     repeat_tracks.finalize();
 
+    ivl_t::sort_and_merge(xtrachr_track);
+
     // print_aggregate_scores_by_tax_ids(nodes);
 
     div_stats.m_genome_len += qry_len;
@@ -812,7 +818,16 @@ static void process_qry(
     const ivls_t div_ivls = find_div_intervals(nodes, repeat_tracks.combined, qry_len, tax_map, div_stats);
 
     if (div_ivls.size() <= 1) { // no hits (div_ivls is empty), or no chimeras (div_ivls.size() == 1)
-        process_ivl(ivl_t{1, qry_len}, fn::cfrom(nodes), qry_id, qry_len, collapsed_all_track, repeat_tracks, tax_map, ostr);
+        process_ivl(
+            ivl_t{1, qry_len},
+            fn::cfrom(nodes),
+            qry_id,
+            qry_len,
+            collapsed_all_track,
+            repeat_tracks,
+            xtrachr_track,
+            tax_map,
+            ostr);
         return;
     }
 
@@ -842,7 +857,17 @@ static void process_qry(
             next_beg = e;
         }
 
-        process_ivl(div_ivl, fn::from(b, e), qry_id, qry_len, collapsed_all_track, repeat_tracks, tax_map, ostr);
+        process_ivl(
+            div_ivl,
+            fn::from(b, e),
+            qry_id,
+            qry_len,
+            collapsed_all_track,
+            repeat_tracks,
+            xtrachr_track,
+            tax_map,
+            ostr
+        );
     }
 }
 
@@ -899,7 +924,7 @@ namespace GP_31225
     {
         namespace tsv = rangeless::tsv;
 
-        auto seen_sbj_ids = std::set<seq_id_str_t>{};
+        //auto seen_sbj_ids = std::set<seq_id_str_t>{};
         auto current_rgn = region_t{};
 
         ConsumeMetalineHeader(istr, GX_TSV_HEADER__HITS);
@@ -1024,25 +1049,40 @@ void gx::Taxify(
     auto qry_len           = len_t{ k_invalid_len }; // NB: not 0, GP-33468
     auto nodes             = nodes_t{};
     auto repeat_tracks     = repeat_tracks_t{};
+    auto xtrachr_track     = ivls_t{}; // extrachromosomal: plastids, plasmids, mito
     auto seen_queries      = std::set<seq_id_str_t>{};
+
     auto process_and_reset = [&](const seq_id_str_t& next_seq_id)
     {
-        process_qry(nodes, current_qry_id, qry_len, repeat_tracks, tax_map, div_stats, ostr);
+        process_qry(nodes, current_qry_id, qry_len, repeat_tracks, xtrachr_track, tax_map, div_stats, ostr);
 
         current_qry_id = next_seq_id;
         qry_len = k_invalid_len;
         nodes.clear();
         repeat_tracks.clear();
-        VERIFY(seen_queries.insert(next_seq_id).second); // expecting unique
+        xtrachr_track.clear();
+
+        if (!seen_queries.insert(next_seq_id).second) {
+            GX_THROW("Duplicate seq_id in in the input of `gx taxify`: " + next_seq_id);
+        }
     };
+
+    // extra-whitespace at the end of the header to add run-info in the end
+    static const size_t metaline_header_reserved_size = 
+        get_env("GX_METALINE_HEADER_RESERVED_SIZE", 1024ul);
 
     const std::string metaline =
         add_db_info(MakeMetaLine(GX_TSV_HEADER__PRE_TAXONOMY_RPT), db_path)
-        + std::string(512, ' '); // reserved space; will insert run-info in the end
+        + std::string(metaline_header_reserved_size, ' '); 
 
-    // (xp,lc,co,Ns)-len: transposon-specific, low-complexity, conserved, N-runs
+    // (xp,lc,co,n,xc)-len:
+    //      xp: transposon-specific
+    //      lc: low-complexity
+    //      co: conserved across many divs
+    //      n:  N-runs
+    //      xc: extrachromosomal (plastid|plasmid|mito)
     ostr << metaline
-         <<  "\n#seq-id\tseq-len\t(xp,lc,co,n)-len\tcvg-by-all\tsep1"
+         <<  "\n#seq-id\tseq-len\t(xp,lc,co,n,xc)-len\tcvg-by-all\tsep1"
              "\ttax-name-1\ttax-id-1\tdiv-1\tcvg-by-div-1\tcvg-by-tax-1\tscore-1"
                    "\tsep2\ttax-id-2\tdiv-2\tcvg-by-div-2\tcvg-by-tax-2\tscore-2"
                    "\tsep3\ttax-id-3\tdiv-3\tcvg-by-div-3\tcvg-by-tax-3\tscore-3"
@@ -1074,8 +1114,18 @@ void gx::Taxify(
         ivl.pos = ivl.pos < 0 ? flip_pos1(ivl.pos, ivl.len) : ivl.pos;
         const auto it = exclude_locs.find(seq_id);
         return it != exclude_locs.end()
-            && ivl_t::get_overlapping_v(it->second, ivl) % fn::exists_where L(ivl_t::uoverlap(_, ivl) * 3 > ivl.len);
+            && (    
+                    ivl_t::get_overlapping_v(it->second, ivl) 
+                  % fn::exists_where L(ivl_t::uoverlap(_, ivl) * 3 > ivl.len)
+               );
     };
+
+    const locs_map_t extrachromosomal_locs = [&]
+    {
+        const auto path = str::replace_suffix(db_path, ".gxi", ".extrachromosomal.tsv");
+        std::ifstream ifstr{ path }; // only present in newer dbs.
+        return ifstr.good() ? LoadLocsMap(ifstr) : locs_map_t{};
+    }();
 
     // ######################################################################
 
@@ -1170,6 +1220,13 @@ void gx::Taxify(
             // the high identity hits to human stand out more (See GP-32031 comment 11/19/21 08:37 AM)
 
             nodes.push_back(node_t{ ivl, sbj_tax_id, score });
+
+
+            if (   extrachromosomal_locs.count(sbj_seq_id)
+                && tax_map.at(sbj_tax_id).gx_taxdiv == asserted_div)
+            {
+                xtrachr_track.push_back(ivl);
+            }
         }
     }
 

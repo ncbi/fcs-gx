@@ -38,34 +38,28 @@ namespace gx
 class CSmallIndex
 {
 public:
-    struct minword20_t
-    {
-        minword20_t() : w(0), is_flipped(0)
-        {}
 
-        minword20_t(const skip_mod3_buf_t& b)
-        {
-            uint64_t buf = b.get();
-            buf &= Ob1x(20);
-
-            // Select orientation.
-            auto flipped_buf = revcomp_bits(buf, 20); // number of bits in the mask
-            this->is_flipped = flipped_buf < buf;
-            this->w = uint32_t(is_flipped ? flipped_buf : buf);
-        }
-
-        uint32_t w;
-        bool is_flipped;
-    };
-
+#if 1
+    using hmer20_t = hmer_t<uint32_t, 20>;
     static const int k_word_tlen = 29; // template: 0b11011011011011011011011011011
-
-    // convert inclusive 0-based inclusive positional stop-pos of a word
-    static inline pos1_t make_word_start_pos1(size_t stop_pos, bool is_flipped)
+#else
+    // GP-35566 - stalling this change pending publication
+    //
+    // NB: Insert extra 6 don't-care positions (two codons in two places),
+    // making template length 29+6=35; to allow arbitrarily-spaced mismatches
+    // (not just separated by a distance of multiple-of-3).
+    static const int k_word_tlen = 35; 
+    struct hmer20_t : public hmer_t<uint32_t, 20>
     {
-        return is_flipped ? (int32_t(stop_pos) + 1) * -1 // stop-pos becomes start-pos in opposite orientation
-                          : (int32_t(stop_pos) + 1) + 1 - k_word_tlen; // -1 to convert to endpos, and convert to startpos
-    }
+        hmer20_t(uint64_t buf) 
+            : hmer_t<uint32_t, 20>(
+                    (buf & 0b00000000000000000000000000011011011)
+                 |  (buf & 0b00000000000011011011011000000000000) >> 3
+                 |  (buf & 0b11011011000000000000000000000000000) >> 6
+              )         // 0b110110110---110110110110---11011011 - template
+        {}   
+    };
+#endif
 
     struct node_t
     {
@@ -90,32 +84,9 @@ public:
     /////////////////////////////////////////////////////////////////////////
 
 private:
-    using nodes_t = std::vector<node_t>;
-
-    struct nodes_view_t
-    {
-        using iterator = nodes_t::const_iterator;
-
-        iterator b = {};
-        iterator e = {};
-
-        const iterator begin() const
-        {
-            return b;
-        }
-
-        const iterator end() const
-        {
-            return e;
-        }
-
-        size_t size() const
-        {
-            return size_t(e - b);
-        }
-    };
-
-    using offsets_t = std::array<uint32_t, 256>;
+    using nodes_t      = std::vector<node_t>;
+    using nodes_view_t = fn::view<nodes_t::const_iterator>;
+    using offsets_t    = std::array<uint32_t, 256>;
 
     struct bucket_t
     {
@@ -135,8 +106,8 @@ public:
     CSmallIndex& operator=(CSmallIndex&&) = default;
 
     /////////////////////////////////////////////////////////////////////////
-    // the pos1 is expected to be negative iff minword is flipped
-    void insert(const minword20_t minword, pos1_t pos);
+    // the pos1 is expected to be negative iff hmer is flipped
+    void insert(const hmer20_t hmer, pos1_t pos);
 
     void finalize();
 
@@ -154,7 +125,7 @@ public:
         return m_finalized;
     }
 
-    nodes_view_t at(minword20_t) const;
+    nodes_view_t at(hmer20_t) const;
 
     /////////////////////////////////////////////////////////////////////////
     std::vector<bucket_t> m_buckets = {}; // 4096 in size; upper 12 bits of key address the bucket

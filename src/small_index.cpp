@@ -22,41 +22,31 @@
 -----------------------------------------------------------------------------
 */
 #include "small_index.hpp"
-#include "types.hpp"
-#include "seq_info.hpp"
-#include <mutex>
-#include <math.h>
-#include <algorithm>
 
 using namespace gx;
-
 using rangeless::fn::operators::operator%=;
-using rangeless::fn::operators::operator%;
-
 
 // 20-bit key
 struct key20_t
 {
-    // subkeys:
     uint16_t key12; // index into m_buckets
     uint8_t  key8;  // attached to the value
 
-    key20_t(uint32_t k = 0)
-      : key12(k & Ob1x(12))
-      , key8((k >> 12) & Ob1x(8))
-    {
-        VERIFY(k >> 20 == 0);
-    }
+    key20_t(gx::CSmallIndex::hmer20_t h)
+      : key12{ uint16_t(h.w & Ob1x(12)) }
+      , key8{  uint8_t(h.w >> 12) }
+    {}
 };
 
+/////////////////////////////////////////////////////////////////////////////
 
-void gx::CSmallIndex::insert(const minword20_t minword, pos1_t pos)
+void gx::CSmallIndex::insert(const hmer20_t hmer, pos1_t pos)
 {
     ASSERT(!m_finalized);
 
-    VERIFY(minword.is_flipped == (pos < 0));
+    VERIFY(hmer.is_flipped == (pos < 0));
 
-    const key20_t key{ minword.w };
+    const key20_t key{ hmer };
 
     auto& nodes = m_buckets.at(key.key12).nodes;
 
@@ -69,7 +59,6 @@ void gx::CSmallIndex::insert(const minword20_t minword, pos1_t pos)
 }
 
 /////////////////////////////////////////////////////////////////////////////
-
 
 void gx::CSmallIndex::finalize()
 {
@@ -103,12 +92,11 @@ void gx::CSmallIndex::finalize()
 
 /////////////////////////////////////////////////////////////////////////
 
-
-gx::CSmallIndex::nodes_view_t gx::CSmallIndex::at(minword20_t minword) const
+gx::CSmallIndex::nodes_view_t gx::CSmallIndex::at(hmer20_t hmer) const
 {
     ASSERT(m_finalized);
 
-    const key20_t key{ minword.w };
+    const key20_t key{ hmer };
 
     const auto& bucket = m_buckets.at(key.key12);
 

@@ -166,6 +166,18 @@ struct ivl_t
     static const ivl_t s_whole_ivl;
 };
 
+static inline ivl_t as_ivl(size_t stop_pos0, size_t len, bool is_flipped)
+{
+    auto start_pos = 
+        is_flipped ? (int32_t(stop_pos0) + 1) * -1 // stop-pos becomes start-pos in opposite orientation
+                   : (int32_t(stop_pos0) + 1) + 1 - (len_t)len; 
+                                      // + 1 to make 1-based
+                                      //      + 1 to convert stop-pos to exclusive end-pos
+                                      //            subtract len to convert to start-pos
+    return ivl_t{ start_pos, (len_t)len };
+}
+
+
 using locs_map_t = std::map<seq_id_str_t, ivls_t>;
 auto LoadLocsMap(std::istream& istr_ptr) -> locs_map_t;
 

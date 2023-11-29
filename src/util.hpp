@@ -142,23 +142,36 @@ struct str
         return s.find(substr) != std::string::npos;
     }
 
-    static inline std::string replace(std::string s, const std::string& substr, const std::string& new_substr)
+    [[ nodiscard ]]
+    static inline std::string replace_suffix(
+        std::string s,
+        const std::string& old_sfx,
+        const std::string& new_sfx)
     {
-        auto pos = s.find(substr);
-        if (pos != std::string::npos) {
-            s.replace(pos, substr.length(), new_substr);
+        if (str::endswith(s, old_sfx)) {
+            s.resize(s.size() - old_sfx.size());
+            s += new_sfx;
         }
         return s;
     }
 
-
-    static inline std::string replace_all(std::string s, const std::string& substr, const std::string& new_substr)
+    [[ nodiscard ]]
+    static inline std::string replace(
+        std::string s, // taking by value, returning via NRVO
+        const std::string& substr,
+        const std::string& new_substr,
+        size_t count = size_t(-1))
     {
+        VERIFY(!substr.empty());
+
+        size_t n = 0;
+
         for (auto pos = s.find(substr);
-             pos != std::string::npos; 
+             pos != std::string::npos && n < count;
              pos = s.find(substr, pos + new_substr.size()))
         {
             s.replace(pos, substr.length(), new_substr);
+            ++n;
         }
         return s;
     }
@@ -305,6 +318,9 @@ auto make_vec_of_iterators(Container&& cont)
 // reverse-complement lower num_bits.
 uint64_t revcomp_bits(uint64_t buf, uint8_t num_bits);
 
+// drop every third bit starting with 3'rd lsb
+uint64_t drop_every_3rd_bit(uint64_t buf);
+
 // for each transitively adjacent-equal-by-get-key group of elements, invoke fn on the group.
 template<typename Iterable, typename KeyFn, typename DoFn>
 void for_each_group_by(
@@ -396,25 +412,38 @@ auto sum_by(const Xs& xs, const F& fn) -> decltype(fn(*xs.begin()))
 
 
 /////////////////////////////////////////////////////////////////////////////
-// For executing code during stack-unwinding.
-// See https://en.cppreference.com/w/cpp/error/uncaught_exception
+/// For executing code on scope-exit (via exception or normally).
+/// See https://en.cppreference.com/w/cpp/error/uncaught_exception
 template<typename UnaryInvokable>
-auto make_exception_scope_guard(UnaryInvokable fn)
+auto make_scope_guard(UnaryInvokable fn/*fn(bool is_exception){ ... }*/)
 {
     struct guard_t
     {
         UnaryInvokable fn;
-                   int orig_ue_count;
-                  bool dismissed;
+        const int orig_uncaught_ex_count;
+        // If the user code needs to be able to dismiss the guard,
+        // they can conditionally do it in fn's body.
 
-        ~guard_t()
+        ~guard_t() noexcept(false) // allow fn to throw without aborting.
         {
-            if (!dismissed && orig_ue_count < std::uncaught_exceptions()) {
-                fn();
-            }
+            const bool is_exception = orig_uncaught_ex_count < std::uncaught_exceptions();
+            fn(is_exception);
         }
     };
-    return guard_t{ std::move(fn), std::uncaught_exceptions(), false };
+    return guard_t{ std::move(fn), std::uncaught_exceptions() };
+}
+
+/// For executing code on scope-exit during stack-unwinding.
+/// See https://en.cppreference.com/w/cpp/error/uncaught_exception
+template<typename NullaryInvokable>
+auto make_exception_scope_guard(NullaryInvokable fn)
+{
+    return make_scope_guard([fn = std::move(fn)](bool is_exception)
+    {
+        if (is_exception) {
+            fn();
+        }
+    });
 }
 
 /////////////////////////////////////////////////////////////////////////////

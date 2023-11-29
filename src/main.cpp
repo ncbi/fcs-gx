@@ -316,7 +316,7 @@ static int run(int argc, char* argv[])
         PairwiseCompareMinHashes(istr, ostr);
 
     } else if (command == "taxify") {
-        auto taxa_ifstr = open_ifstream(str::replace(db_path, ".gxi", ".taxa.tsv"));
+        auto taxa_ifstr = open_ifstream(str::replace_suffix(db_path, ".gxi", ".taxa.tsv"));
         Taxify(istr, taxa_ifstr, hardmask_locs_path, asserted_div, db_path, out_path);
 
     } else if (command == "clean-genome") {
@@ -353,7 +353,7 @@ int main(int argc, char** argv)
         return run(argc, argv);
 
     } catch(const std::exception& e) {
-        std::cerr << "Fatal error (" << typeid(e).name() << "): " << e.what() << "\n";
+        std::cerr << "Fatal error: " << e.what() << "\n";
         return EXIT_FAILURE;
     } // catch(...) - not doing that because have nothing to report
       //            - let std::terminate to happen naturally

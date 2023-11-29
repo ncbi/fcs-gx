@@ -167,14 +167,6 @@ struct sbj_seq_t
         return na_t(pos > 0 ? bases_p[na2bit] : bases_m[na2bit]);
     }
 
-    // return as 1-bit-alphabet na, as if via bit_view_t.
-    bool_na_t at1_as_bool_na_t(pos1_t pos) const
-    {
-        // 0123 -> ACGT;
-        // [AG, CT] -> [false, true ]
-        return bool_na_t((m_data.get(as_pos0(pos)) % 2 != 0) ^ (pos < 0));
-    }
-
     using subbyte_array_t = subbyte_array<2>;
 
     const subbyte_array_t& data() const

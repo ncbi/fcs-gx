@@ -174,8 +174,22 @@ void gx::MakeDb(     std::istream& fasta_istr,
                      std::istream* softmask_istr_ptr,
                 const std::string& out_path) // /path/to/out_db.gxi
 {
+    auto get_num_locs = [](const locs_map_t& loc_map)
+    {
+        return fn::cfrom(loc_map)
+             % fn::transform L(_.second.size()) 
+             % fn::foldl_d([](size_t ret, size_t n) { return ret + n; });
+    };
+
     const auto hardmask_map = hardmask_istr_ptr ? LoadLocsMap(*hardmask_istr_ptr) : locs_map_t{};
+    if (hardmask_istr_ptr) {
+        std::cerr << "Loaded hardmask map: " << get_num_locs(hardmask_map) << " locs.\n";
+    }
+
     const auto softmask_map = softmask_istr_ptr ? LoadLocsMap(*softmask_istr_ptr) : locs_map_t{};
+    if (softmask_istr_ptr) {
+        std::cerr << "Loaded softmask map: " << get_num_locs(softmask_map) << " locs.\n";
+    }
 
     /////////////////////////////////////////////////////////////////////////
 
@@ -187,7 +201,7 @@ void gx::MakeDb(     std::istream& fasta_istr,
         ConsumeMetalineHeader(seq_id2tax_id_istr, GX_TSV_HEADER__SEQ_ID_MAPPING);
         for (const tsv::row_t& row : tsv::from(seq_id2tax_id_istr)) {
             VERIFY(row.size() == 2);
-            ret.emplace_back( seq_id_str_t{              row[0]  },
+            ret.emplace_back( seq_id_str_t{             row[0] },
                                   tax_id_t{ tsv::to_num(row[1])});
         }
         std::cerr << "Loaded seq-ids: " << ret.size() << "\n";
@@ -232,7 +246,9 @@ void gx::MakeDb(     std::istream& fasta_istr,
     {
         auto ret = std::map<seq_id_str_t, seq_oid_t>{};
         for (const auto& x : seq_infos) {
-            VERIFY(ret.emplace(seq_id_str_t(x.get_seq_id()), x.seq_oid).second); // expecting unique seq-ids
+            if (!ret.emplace(seq_id_str_t(x.get_seq_id()), x.seq_oid).second) {
+                GX_THROW(std::string{} + "Duplicate seq_id unexpected: " + x.get_seq_id());
+            }
         }
         return ret;
     }();
@@ -316,8 +332,6 @@ void gx::MakeDb(     std::istream& fasta_istr,
                      || str::endswith(inp_chunk.seq, "TAG")
                      || str::endswith(inp_chunk.seq, "TGA"))));
 
-        const auto bits = bool_na_view_t{ inp_chunk.seq };
-
         // Will use small k_stride for proks, and 2*k_stride for euks
         // to give more sensitivity to proks.
         const auto tax_id = seq_infos.at(inp_chunk.seq_oid).tax_id;
@@ -343,10 +357,8 @@ void gx::MakeDb(     std::istream& fasta_istr,
             const size_t end   = size_t(ivl.endpos() - 1) - inp_chunk.offset; // 0-based chunk-local coordinate
             VERIFY(start < inp_chunk.seq.size());
 
-            auto buf = skip_mod3_buf_t::init_from(bits, CIndex::k_word_tlen, start);
-            for (const auto i : irange{ start + CIndex::k_word_tlen, end }) {
-                buf <<= bits[i];
-                size_t i_pos = inp_chunk.offset + i;
+            for(auto kmer = kmer_ci_t(inp_chunk.seq, CIndex::k_word_tlen, start); kmer && kmer.i < end; ++kmer) {
+                size_t i_pos = inp_chunk.offset + kmer.i;
 
                 if ((i_pos + 1 - CIndex::k_word_tlen) % stride != 0) {
                     // Choosing positions where the word-start is in proper coding phase,
@@ -354,9 +366,9 @@ void gx::MakeDb(     std::istream& fasta_istr,
                     continue;
                 }
 
-                const auto minword = CIndex::minword38_t{ buf };
-                const auto pos1 = CIndex::make_word_start_pos1(i_pos, minword.is_flipped);
-                index.insert(minword, inp_chunk.seq_oid, pos1);
+                const auto hmer = CIndex::hmer38_t{ kmer.buf };
+                const auto pos1 = as_ivl(i_pos, CIndex::k_word_tlen, hmer.is_flipped).pos;
+                index.insert(hmer, inp_chunk.seq_oid, pos1);
             }
         }
 
@@ -381,7 +393,7 @@ void gx::MakeDb(     std::istream& fasta_istr,
     // the view into the desired seq-interval with zero-overhead.
 
     VERIFY(str::endswith(out_path, ".gxi"));
-    std::ofstream o_seq{ str::replace(out_path, ".gxi", ".gxs") };
+    std::ofstream o_seq{ str::replace_suffix(out_path, ".gxi", ".gxs") };
     VERIFY(o_seq);
 
     auto dump_seq = [&, prev_oid = seq_oid_t()](std::pair<fasta_seq_t, sbj_seq_t> inp) mutable
@@ -467,7 +479,7 @@ void gx::MakeDb(     std::istream& fasta_istr,
       % fn::for_each(dump_seq);
     }
 
-    std::ofstream o_seq_info{ str::replace(out_path, ".gxi", ".seq_info.tsv") };
+    std::ofstream o_seq_info{ str::replace_suffix(out_path, ".gxi", ".seq_info.tsv") };
     VERIFY(o_seq_info);
     size_t num_seqs = 0;
     size_t num_bases = 0;
@@ -505,7 +517,7 @@ void gx::MakeDb(     std::istream& fasta_istr,
         strftime(buf, sizeof(buf), "%Y-%m-%d", std::localtime(&time_now));
 
         VERIFY(str::endswith(out_path, ".gxi"));
-        std::ofstream o_meta{ str::replace(out_path, ".gxi", ".meta.jsonl") };
+        std::ofstream o_meta{ str::replace_suffix(out_path, ".gxi", ".meta.jsonl") };
         o_meta << "{\"build-date\":\""  << std::string{ buf }
                << "\", \"seqs\":"       << num_seqs
                << ", \"Gbp\":"          << float(num_bases)/1e9f
@@ -513,17 +525,22 @@ void gx::MakeDb(     std::istream& fasta_istr,
     }
 
     t = timer{};
-    std::cerr << "Finalizing...\n";
+    std::cerr << "Finalizing..." << std::endl;
     index.finalize(seq_infos);
     std::cerr << "Finalized index in " << float(t)/60 << " minutes.\n\n";
 
     t = timer{};
-    std::cerr << "Serializing...\n";
+    std::cerr << "Serializing..." << std::endl;
     std::ofstream ostr(out_path);
     VERIFY(ostr);
     ser::to_stream(ostr, seq_infos);
     index.to_stream(ostr);
-    std::cerr << "Serialized index in " << float(t)/60 << " minutes.\n";
+    std::cerr << "Serialized index in " << float(t)/60 << " minutes.\n\n";
+
+    t = timer{};
+    std::cerr << "Destroying..." << std::endl;
+    index = CIndex{};
+    std::cerr << "Destroyed index in " << float(t)/60 << " minutes.\n\n";
 }
 
 

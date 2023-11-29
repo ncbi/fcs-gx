@@ -26,7 +26,6 @@
 #include "util.hpp"
 #include "seq_info.hpp"
 #include "segment.hpp"
-#include <mutex>
 
 namespace gx
 {
@@ -49,20 +48,15 @@ namespace gx
 class CTmasker
 {
 public:
-    // 30-bit oriented word, selected as min(w, rev_comp(w))h
-    struct minword30_t
+    struct hmer30_t // not simply uisng hmer_t<uint32_t, 30> because don't need is_flipped field
     {
-        minword30_t() = default;
-
-        minword30_t(const skip_mod3_buf_t& b)
-        {
-            uint64_t buf = b.get();
-            buf &= Ob1x(30);
-            auto flipped_buf = revcomp_bits(buf, 30); // number of bits in the mask
-            this->w = uint32_t((flipped_buf < buf)? flipped_buf : buf);
-        }
         uint32_t w = 0;
+
+        hmer30_t(uint64_t buf)
+            : w{ hmer_t<uint32_t, 30>(buf).w }
+        {}
     };
+
     static const int k_word_tlen = 44; // template: 0b11011011011011011011011011011011011011011011
 
 public:
@@ -92,30 +86,12 @@ public:
 #endif
 
 
-    void insert(const minword30_t minword)
+    void insert(const hmer30_t hmer);
+
+
+    uint8_t at(const hmer30_t hmer) const
     {
-        //using lock_t = rangeless::mt::lockables::atomic_mutex;
-        using lock_t = std::mutex;
-
-        static std::array<lock_t, 4096> s_mutexes;
-        const std::lock_guard<lock_t> lg{ s_mutexes[minword.w % s_mutexes.size()] };
-
-        auto& dest = m_counts[minword.w];
-
-#if 1
-        dest = uint8_t(dest + (dest < 250));
-#else
-        // if we wanted to count the flip-instanecs only
-        if (dest.flipped != minword.is_flipped) {
-            dest.flipped = minword.is_flipped;
-            dest.val = uint8_t(dest.val + (dest.val < 100)); // NB: using 7 bits, so can't exceed 128
-        }
-#endif
-    }
-
-    uint8_t at(const minword30_t minword) const
-    {
-        return m_counts[minword.w];
+        return m_counts[hmer.w];
     }
 
     const counts_t& counts() const
@@ -137,6 +113,8 @@ public:
     void process_fasta(std::istream& fasta_istr, std::ostream& ostr) const;
 
 private:
+    static constexpr uint8_t k_count_cap = 250;
+
     float m_baseline = 0.0f; // expected number of occurrences of a non-frequent word
     counts_t m_counts = {}; // empty or size = 2^30
 };

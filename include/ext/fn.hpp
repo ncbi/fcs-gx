@@ -1016,7 +1016,7 @@ namespace get
         view() = default;
 
         using iterator = Iterator;
-        using value_type = typename iterator::value_type;
+        using value_type = typename std::iterator_traits<Iterator>::value_type;
 
         Iterator begin() const { return it_beg; }
         Iterator end()   const { return it_end; }
@@ -1053,6 +1053,11 @@ namespace get
         bool empty() const
         {
             return it_beg == it_end;
+        }
+
+        size_t size() const
+        {
+            return std::distance(it_beg, it_end);
         }
     };
 

@@ -100,6 +100,10 @@ Please see the [GitHub documentation](https://github.com/ncbi/fcs/wiki/FCS-GX) f
 
 Please see [release history](https://github.com/ncbi/fcs/releases) 
 
+## Citing FCS-GX
+
+Astashyn A, Tvedte ES, Sweeney D, Sapojnikov V, Bouk N, Joukov V, Mozes E, Strope PK, Sylla PM, Wagner L, Bidwell SL, Clark K, Davis EW, Smith-White B, Hlavina W, Pruitt KD, Schneider VA, Murphy TD. [Rapid and sensitive detection of genome contamination at scale with FCS-GX](https://www.biorxiv.org/content/10.1101/2023.06.02.543519v1). biorXiv. (2023).
+
 ## Contact
 
 Please create an [issue](https://github.com/ncbi/fcs-gx/issues) if you encounter any problems.

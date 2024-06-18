@@ -218,7 +218,7 @@ void gx::UngappedExtendSegsInPlace(
     //
 
     // TODO: switch to default of 40 in the future. GP-35566
-    static const float x_dropoff_score = get_env("GX_UNGAPPED_DROPOFF_SCORE", 20.0f);
+    static const float x_dropoff_score = get_env("GX_UNGAPPED_DROPOFF_SCORE", 40.0f);
 
     for (float mismatch_score : { -9.0f, -4.0f, -2.0f}) // -9 targets 90% identity; -4 targets 80% identity -2 targets 60% identity
         for (size_t reverse_orientation : { false, true })

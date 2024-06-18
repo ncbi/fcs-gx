@@ -26,10 +26,12 @@
 #include "util.hpp"
 #include "tmasker.hpp"
 #include "segment.hpp"
+
 using namespace gx;
 
 using fn::operators::operator%; // see fn.hpp
 using fn::operators::operator%=;
+using fn::operators::operator<<=;
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -67,31 +69,18 @@ void gx::CTmasker::insert(const hmer30_t hmer)
 }
 
 
-gx::CTmasker::CTmasker(std::istream& fasta_istr1)
+// Process fasta in chunks in parallel.
+//
+// Only process sequences that are at least N80 in length -
+// the intent is to avoid collecting repeat-statistics from potential contaminants.
+// 
+// Return total_len.
+static size_t s_process_fasta(std::istream& fasta_istr, std::function<void(fasta_seq_t)> process_chunk)
 {
-    m_counts.resize(1<<30);
-    const auto t = timer{};
-
     size_t total_len = 0;
     size_t short_seqs_len = 0;
 
-    const auto fill_index_from_chunk = [&](fasta_seq_t inp_chunk)
-    {
-        size_t last_N_pos = -1;
-
-        for (auto kmer = kmer_ci_t(inp_chunk.seq, CTmasker::k_word_tlen); kmer; ++kmer) {
-            if (inp_chunk.seq[kmer.i] == 'N' || inp_chunk.seq[kmer.i] == 'n') {
-                last_N_pos = kmer.i;
-            } else if (kmer.i > last_N_pos + CTmasker::k_word_tlen) {
-                this->insert(CTmasker::hmer30_t{ kmer.buf });
-            }
-        }
-        return inp_chunk;
-    };
-
-    std::cerr << "Collecting masking statistics..." << std::endl;
-
-    MakeFastaReader(fasta_istr1, k_fasta_chunk_stride, k_fasta_chunk_overlap)
+    MakeFastaReader(fasta_istr, k_fasta_chunk_stride, k_fasta_chunk_overlap)
 
     // Ignoring alt-loci - if there are many of them for a particular locus,
     // it may make the counts for it look repeat-like.
@@ -119,7 +108,7 @@ gx::CTmasker::CTmasker(std::istream& fasta_istr1)
     {
         static const auto long_seq_len_thr = get_env("GX_TMASKER_LONG_SEQ_LEN", 100000ul);
         if (inp.seq.size() >= long_seq_len_thr) {
-            fill_index_from_chunk(std::move(inp));
+            process_chunk(std::move(inp));
             inp.seq.clear(); // mark as used.
         }
         return inp;
@@ -142,9 +131,35 @@ gx::CTmasker::CTmasker(std::istream& fasta_istr1)
   % fn::drop_while L((short_seqs_len += _.seq.size()) * 5 < total_len)
 
     // Fill-in the index from the remainder of short queries longer than N80
-  % fn::transform_in_parallel(fill_index_from_chunk).queue_capacity(s_get_num_cores())
+  % fn::transform_in_parallel([&](fasta_seq_t inp)
+    {
+        process_chunk(std::move(inp));
+        return 0;
+    }).queue_capacity(s_get_num_cores())
 
   % fn::for_each L(void(_)); // iterate over lazy-seq to actually do the work.
+
+    return total_len;
+}
+
+gx::CTmasker::CTmasker(std::istream* fasta_istr_ptr)
+{
+    if (!fasta_istr_ptr) {
+        return;
+    }
+
+    m_counts.resize(1<<30);
+    const auto t = timer{};
+
+    std::cerr << "Collecting masking statistics..." << std::endl;
+
+    const size_t total_len = s_process_fasta(*fasta_istr_ptr, [&](fasta_seq_t inp_chunk)
+    {
+        process_kmers(inp_chunk.seq, CTmasker::k_word_tlen, [&](size_t, kmer_bufs_t bufs)
+        {
+            this->insert(CTmasker::hmer30_t{ bufs.onebit });
+        });
+    });
 
     /////////////////////////////////////////////////////////////////////////
     // compute and set m_baseline
@@ -170,14 +185,6 @@ gx::CTmasker::CTmasker(std::istream& fasta_istr1)
               << "Baseline: " << m_baseline << "\n\n";
 }
 
-gx::CTmasker::CTmasker(const std::string& fasta_path)
-{
-    if (fasta_path.empty()) {
-        return; // construct empty tmasker if path is empty
-    }
-    auto istream = open_ifstream(fasta_path);
-    *this = CTmasker{ istream };
-}
 
 gx::ivls_t gx::CTmasker::find_repeats(const iupacna_seq_t& seq) const
 {
@@ -207,24 +214,20 @@ gx::ivls_t gx::CTmasker::find_repeats(const iupacna_seq_t& seq) const
     VERIFY(min_repeat_len >= CTmasker::k_word_tlen);
 
     auto ivls = ivls_t{};
-#if 1
-    for (auto kmer = kmer_ci_t(seq, CTmasker::k_word_tlen); kmer; ++kmer) {
-        if (this->at(kmer.buf) < min_repeat_sup) {
-            continue;
-        }
 
-        const auto ivl = ivl_t{ pos1_t(kmer.i + 2 - CTmasker::k_word_tlen), CTmasker::k_word_tlen };
-        // +1 to convert stop-pos to end-pos;
-        // +1 to make 1-based;
-        // -k_word_tlen to convert to start-pos
+    process_kmers(seq, CTmasker::k_word_tlen, [&](size_t i, kmer_bufs_t bufs)
+    {
+        const auto ivl = ivl_t{ pos1_t(i + 1), CTmasker::k_word_tlen };
 
-        // merge if high-overlap (i.e. avoid merging suprious at this stage)
-        if (!ivls.empty() && ivls.back().endpos() + 3 >= ivl.endpos()) {
+        if (this->at(hmer30_t{ bufs.onebit }) < min_repeat_sup) {
+            ;
+        } else if (!ivls.empty() && ivls.back().endpos() + 3 >= ivl.endpos()) {
+            // merge if high-overlap (i.e. avoid merging suprious at this stage)
             ivls.back().len = ivl.endpos() - ivls.back().pos;
         } else {
             ivls.push_back(ivl);
         }
-    }
+    });
 
     // Drop suprious.
     ivls %= fn::where L(_.len > CTmasker::k_word_tlen + 10);
@@ -250,41 +253,6 @@ gx::ivls_t gx::CTmasker::find_repeats(const iupacna_seq_t& seq) const
         ivls[i-1] = ivl_t{};
     }
 
-#else // experimental
-    size_t last_N_pos = 0;
-    
-    static thread_local std::vector<uint32_t> ccounts{}; // cumulative counts
-    ccounts.resize(seq.size());
-
-    for (auto kmer = kmer_ci_t(seq, CTmasker::k_word_tlen); kmer; ++kmer) {
-        if (seq.at(kmer.i) == 'N' || seq.at(kmer.i) == 'n') {
-            last_N_pos = kmer.i;
-        }
-
-        ccounts[kmer.i] = ccounts[kmer.i - 1] + (kmer.i < last_N_pos + CTmasker::k_word_tlen ? 0 : this->at(kmer.buf));
-        VERIFY(ccounts[kmer.i - 1] < ccounts[kmer.i]);
-    }
-
-    for (size_t i = min_repeat_len; i < seq.size(); ++i) {
-        const double n = double(ccounts[i] - ccounts[i - min_repeat_len]) / double(min_repeat_len);
-
-        if (n < min_repeat_sup) {
-            continue;
-        }
-
-        const auto ivl = ivl_t{ pos1_t(i + 2 - min_repeat_len), min_repeat_len };
-        // +1 to convert stop-pos to end-pos;
-        // +1 to make 1-based;
-        // -k_word_tlen to convert to start-pos
-
-        // merge if high-overlap (i.e. avoid merging suprious at this stage)
-        if (!ivls.empty() && ivls.back().endpos() >= ivl.pos) {
-            ivls.back().len = ivl.endpos() - ivls.back().pos;
-        } else {
-            ivls.push_back(ivl);
-        }
-    }
-#endif
     ivls %= fn::where L(_.len > min_repeat_len);
 
     return ivls;
@@ -374,3 +342,5 @@ void gx::CTmasker::process_fasta(std::istream& fasta_istr, std::ostream& ostr) c
 
     std::cerr << "Processed repeats in " << float(t) << "s.\n";
 }
+
+

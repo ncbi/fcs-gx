@@ -383,16 +383,18 @@ def check_space(mft, dir):
 def download_file_with_aria(url, file_path):
 
     aria_config = file_path.with_suffix(".aria2_config")
+    num_connections = 4 if "ncbi.nlm.nih.gov" in url else 16
+
     with open(aria_config, "w", encoding="ascii") as f:
-        f.write("""
+        f.write(f"""
             file-allocation=none
             check-certificate=false
             allow-overwrite=true
             auto-file-renaming=false
             max-tries=5
-            max-connection-per-server=5
-            max-concurrent-downloads=5
-            split=5
+            max-concurrent-downloads=2
+            max-connection-per-server={num_connections}
+            split={num_connections}
             console-log-level=warn
         """)
 

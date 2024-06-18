@@ -26,8 +26,8 @@
 
 #include "types.hpp"
 #include "segment.hpp"
-
 #include "serial_util.hpp"
+#include "ext/json5.hpp"
 
 // for rusage
 #include <unistd.h>
@@ -73,6 +73,47 @@ uint64_t gx::revcomp_bits(uint64_t w, uint8_t num_bits)
     return ~w >> (64 - num_bits); // flip the bits and shift into lsbs.
 }
 
+
+// Reverse-complement 2-bit-encoded word ending in LSB
+uint64_t gx::revcomp_twobits(uint64_t w, uint8_t word_len)
+{
+    ASSERT(word_len <= 32);
+
+    // First, reverse the order of letters.
+    static const uint64_t k2  = 0x3333333333333333UL;
+    static const uint64_t k4  = 0x0F0F0F0F0F0F0F0FUL;
+    w = (( w >>  2 ) & k2  ) | (( w & k2  ) <<  2 ); // swap bit-pairs
+    w = (( w >>  4 ) & k4  ) | (( w & k4  ) <<  4 ); // swap nibbles
+
+#if defined(__GNUC__)
+    w = __builtin_bswap64(w);
+#elif defined(_MSC_VER)
+    w = _byteswap_uint64(w);
+#else
+    static const uint64_t k8  = 0x00FF00FF00FF00FFUL;
+    static const uint64_t k16 = 0x0000FFFF0000FFFFUL;
+    w = (( w >>  8 ) & k8  ) | (( w & k8  ) <<  8 ); // swap single bytes
+    w = (( w >> 16 ) & k16 ) | (( w & k16 ) << 16 ); // swap 2-byte frames
+    w = (( w >> 32 )       ) | (( w       ) << 32 ); // swap 4-byte frames
+#endif
+    // The word is in MSBs after reversal, so shift it back into LSBs,
+    // and flip the bits to complement the 2-bit bases.
+    return ~w >> (2*(32 - word_len));
+}
+
+static const bool test_revcomp_twobits = []
+{
+                 //  T G G C C C A A A A
+    uint64_t x1  = 0b11101001010100000000;
+
+                 //  T T T T G G G C C A
+    uint64_t y1e = 0b11111111101010010100;
+    uint64_t y1a = gx::revcomp_twobits(x1, 10);
+    VERIFY(y1a == y1e);
+    return true;
+}();
+
+
 uint64_t gx::drop_every_3rd_bit(uint64_t w)
 {
     static const uint64_t k1 = 0b0011000011000011000011000011000011000011000011000011000011000011;
@@ -98,6 +139,103 @@ static const bool test_drop_every_3rd_bit = []
     return true;
 }();
 
+/////////////////////////////////////////////////////////////////////////////
+
+using page_residency_t = std::vector<unsigned char>;
+
+static int get_pct_pages_in_core(const page_residency_t& is_resident)
+{
+    const auto num_in_core = std::count_if(is_resident.begin(), is_resident.end(), L(_ != 0));
+    return int(num_in_core * 100 / is_resident.size());
+};
+
+// Wrapper around mincore(2) https://man7.org/linux/man-pages/man2/mincore.2.html
+// that avoids "problematic" invocations that otherwise cause performance issues.
+static page_residency_t get_page_residency(const std::string_view sv, page_residency_t ret = {})
+{
+    static const auto page_size = (size_t)sysconf(_SC_PAGESIZE);
+    const auto num_pages = (sv.size() + page_size - 1) / page_size;
+
+    ret.clear();
+    ret.resize(num_pages);
+
+    // mincore call can be slow (up to 15 seconds even if all pages are in-core),
+    // so first do a quick estimate accessing a random sample of pages and 
+    // checking if the process had any page-faults.        
+    const auto num_pagefaults_orig = ser::get_pagefault_count();
+    static const auto num_iterations = 100ul;
+    
+    {
+        const auto rand_seed = static_cast<uint64_t>(std::time(nullptr));
+        volatile size_t pos = 0; // prevent from optimizing-out
+        for (size_t i = 0; i < num_iterations; i++) {
+            pos = uint64_hash(rand_seed ^ i ^ (uint64_t(sv[pos]) << 32)) % sv.size();
+        }
+    }
+
+    const auto num_pagefaults = ser::get_pagefault_count() - num_pagefaults_orig;
+
+    //std::cerr << "Num-pagefaults: " << num_pagefaults << std::endl;
+
+    if (num_pagefaults <= 1) {
+        // Almost no page-faults - report as-if all pages are in-core.
+        std::fill(ret.begin(), ret.end(), 1);
+
+    } else if (float(num_pagefaults) / float(num_iterations) > 0.8f) {
+        // More than 80% page-faults - report as-if 0% in-core.
+        //
+        // NB: there's a strange performance regression that emerged:
+        // When prefetching a file from disk that is 0% in-core,
+        // (e.g. as-if after vmtouch -e, or from cold storage)
+        // the prefetching loop in prefetch_mmapped_pages is extremely slow
+        // (the program appears stuck and requires CTRL-C).
+        //
+        // Re-running a second time, when the file is even 0.1% in core,
+        // the rest of the file is prefetched at expected rate (~1GiB/s from VAST).
+        //
+        // Avoiding the mincore call below when the file is (nearly) 0% in-core
+        // seems to fix the issue (this else-clause), although I don't know how -
+        // it may be related to the following:
+        //
+        // https://lwn.net/Articles/778437/
+        // https://lwn.net/Articles/776801/
+        //
+        // I think might be a manifestation of a low-level OS issue,
+        // rather than a bug in this code.
+        std::fill(ret.begin(), ret.end(), 0);
+
+    } else if (0 != mincore(const_cast<char*>(sv.data()), sv.size(), ret.data())) {
+        
+        [[ maybe_unused ]] static const bool printed_once = []
+        {
+            std::cerr << "Note: mincore() failed.\n";
+            return true;
+        }();
+
+        std::fill(ret.begin(), ret.end(), 0);
+
+    } else if (get_pct_pages_in_core(ret) == 100) {
+        // Mincore "succeeded", but "lied" for security reasons (see 778437 above).
+        //
+        // "Interestingly, in the cases where mincore() 
+        // does not return actual page-cache residency information,
+        // it reports all pages as being present."
+        //
+        // In this case report all pages as not-present in order to
+        // do full-prefetech, as not to erroneously skip prefetching everything.
+        std::fill(ret.begin(), ret.end(), 0);
+    }
+
+    return ret;
+}
+
+size_t ser::get_pagefault_count()
+{
+    rusage r{};
+    getrusage(RUSAGE_SELF, &r);
+    return r.ru_majflt;
+}
+
 
 /////////////////////////////////////////////////////////////////////////////
 // if `force`, then touch pages even though they are resident, to also prevent minor-page-faults
@@ -116,9 +254,14 @@ void ser::prefetch_mmapped_pages(const std::string& filename, std::string_view s
         return;
     }
 
-    const auto num_pages = (sv.size() + page_size - 1) / page_size;
+    auto is_resident = get_page_residency(sv);
+    const auto num_pages = is_resident.size();
+    const auto pct_pages_in_core = get_pct_pages_in_core(is_resident);
 
-    for (static bool printed_once = false; !printed_once && num_pages > num_phys_pages; printed_once = true) {
+    for (static bool printed_once = false;
+         !printed_once && num_pages > num_phys_pages;
+         printed_once = true)
+    {
         std::cerr << "\033[91m" // red
                   << R"(
     Warning: The host does not have enough physical memory for the gx-database.
@@ -129,43 +272,14 @@ void ser::prefetch_mmapped_pages(const std::string& filename, std::string_view s
         )" << "\033[0m";
     }
 
-    // mincore will set values to non-0 for corresponding resident pages.
-    auto is_resident = std::vector<unsigned char>(num_pages, 0);
-
-    auto get_pct_pages_in_core = [&]
-    {
-        const auto get_rusage = []
-        {
-            rusage r{};
-            getrusage(RUSAGE_SELF, &r);
-            return r;
-        };
-
-        // mincore call is slow (up to 15 seconds even if all pages are in-core),
-        // so first do a quick estimate accessing a random sample of pages and 
-        // checking if the process had any page-faults.        
-        const auto ru_before = get_rusage();
-        const auto rand_seed = static_cast<uint64_t>( time(NULL) );
-        volatile size_t pos = 0; // prevent from optimizing-out
-        for(size_t i = 0; i < 100; i++) {
-            pos = uint64_hash(rand_seed ^ i ^ (uint64_t(sv[pos]) << 32) ) % sv.size();
-        }
-
-        if (get_rusage().ru_majflt == ru_before.ru_majflt) {
-            return 100ul; // assume 100% in-core
-        } else {
-            VERIFY(0 == mincore(const_cast<char*>(sv.data()), sv.size(), is_resident.data()));
-            return std::count_if(is_resident.begin(), is_resident.end(), L(_ != 0)) * 100 / num_pages;
-        }
-    };
-
-    auto pct_pages_in_core = get_pct_pages_in_core();
-
     if (pct_pages_in_core == 100 && !force) {
         return;
     }
 
-    for (static bool printed_once = false; !printed_once && pct_pages_in_core < 100; printed_once = true) {
+    for (static bool printed_once = false;
+         !printed_once && pct_pages_in_core < 100;
+         printed_once = true)
+    {
         std::cerr << R"(
     GX requires the database to be entirely in RAM to avoid thrashing.
     Consider placing the database files in a non-swappable tmpfs or ramfs.
@@ -175,29 +289,37 @@ void ser::prefetch_mmapped_pages(const std::string& filename, std::string_view s
         )";
     }
 
+
+    std::cerr << "\n\n" << filename << " is " << pct_pages_in_core << "% in RAM.\n";
+
+    // Prefetching-loop:
     const auto elapsed = timer{};
     auto last_pct_processed = 0UL;
-    volatile char c = 0;  // volatile to prevent optimizing-out the sv access.
-
     for (const auto i : irange{ num_pages }) {
-        c = (force || !is_resident.at(i)) && sv.at(i * page_size); // touching non-resident pages
+        if (force || !is_resident.at(i)) {
+            const volatile char c = sv.at(i * page_size); // touching non-resident pages
+            (void)c;
+        }
 
         // The rate of this is about the same as vmtouch -t, which does essentially the same thing.
         // However, cat file_on_disk > /dev/null, which also warms the cache, is 50% faster. HOW??
         // NB: __builtin_prefetch, which prefetches from RAM into CPU-cache, is of no use here.
 
-        // update progress message
-        if (const auto pct_processed = i * 100 / num_pages; pct_processed != last_pct_processed) {
-            std::cerr << "Prefetching " << filename << " " << pct_processed << "%...                         \r";
+        // Update progress-message.
+        const auto pct_processed = i * 100 / num_pages;
+        if (pct_processed != last_pct_processed) {
+            std::cerr << "Prefetching " << filename << " " 
+                      << pct_processed << "%...                         \r";
             last_pct_processed = pct_processed;
         }
     }
-    (void)c;
 
-    pct_pages_in_core = get_pct_pages_in_core();
+    // update residency info for reporting.
+    is_resident = get_page_residency(sv, std::move(is_resident));
+
     std::cerr << "\nPrefetched " << filename << " in " << float(elapsed) << "s; "
               << float(sv.size())/1e9f/float(elapsed) << " GB/s. "
-              << "The file is " << pct_pages_in_core << "% in RAM.\n";
+              << "The file is " << get_pct_pages_in_core(is_resident) << "% in RAM.\n";
 }
 
 
@@ -310,41 +432,29 @@ std::string gx::MakeMetaLine(std::string header)
        auto const now = std::chrono::system_clock::to_time_t(
                std::chrono::system_clock::now());
        std::string s{ std::ctime(&now) };
-       if (!s.empty() && s.back() == '\n') {
+       while (!s.empty() && s.back() == '\n') {
            s.pop_back();
        }
        return s;
     }();
 
-    VERIFY(header.back() == ']');
-    header.back() = ',';
-
-    header += " {\"git-rev\":\"";
-    header += g_git_revision;
-    header += "\", \"run-date\":\"";
-    header += time_now_str;
-    header += "\"";
-
     static const std::string s_extra = []
     {
         auto p = std::getenv("GX_METALINE_JSON_EXTRA");
         auto ret = !p ? "" : std::string(p);
-
-        // If does not look like json-array, object, or string, wrap as string.
-        if (!ret.empty() && ret.find_first_of("[{\"") != 0) {
-            VERIFY(ret.find('\"') == std::string::npos);
-            VERIFY(ret.front() != ' ' && ret.back() != ' ');
-            ret = "\"" + ret + "\"";
-        }
         return ret;
     }();
 
+    auto info = json5::value_t{};
+    info["git-rev"] = g_git_revision;
+    info["run-date"] = time_now_str;
     if (!s_extra.empty()) {
-        header += ", \"extra\":";
-        header += s_extra;
+        info["extra"] = json5::parse(s_extra);
     }
 
-    header += "}]";
+    auto j = json5::parse(header.substr(2));
+    j.get<json5::array_t>().push_back(info);
+    header = "##" + json5::to_string(j);
     return header;
 }
 
@@ -393,4 +503,64 @@ std::string_view ser::mmap(const std::string& path)
     }
 
     return std::string_view{ (const char*)ptr, size };
+}
+
+
+std::unique_ptr<std::istream> ser::open_istream(std::string path)
+{
+    VERIFY(path != "-");
+    VERIFY(path != "");
+
+    const bool is_manifest_file = gx::str::endswith(path, ".mft");
+    const auto file_ext = // excluding .mft
+        get_file_extension(path.substr(0, path.size() - (is_manifest_file ? 4 : 0)));
+
+    const auto orig_errno = errno;
+    errno = 0;
+
+    auto ifstr = std::make_unique<std::ifstream>(path, std::ifstream::in);
+
+    if (errno || !*ifstr) {
+        GX_THROW("Failed to open file: " + path + " - " + strerror(errno));
+    }
+
+    errno = orig_errno;
+
+    const std::string decompressor_cmd = 
+          file_ext == ".gz" && system("command -v minigzip >/dev/null") == 0
+                             ? "minigzip -c -d"
+        : file_ext == ".gz"  ?     "gzip -c -d"
+        : file_ext == ".zstd"?     "zstd -c -d"
+        : file_ext == ".lz4" ?      "lz4 -c -d"
+        : file_ext == ".bz2" ?    "bzip2 -c -d"
+        : file_ext == ".xz"  ?       "xz -c -d"
+        : file_ext == ".lzma"?       "xz -c -d"
+        :                                    "";
+
+    static const bool enable_pv = 
+           get_env("GX_ENABLE_PV", false) && (system("command -v pv >/dev/null") == 0);
+    static const auto pv_cmd = std::string{ enable_pv ? " | pv -Wbrat " : "" };
+
+    // NB: do not use zcat, bzcat, xzcat, zstdcat, lz4cat, because
+    // in the context of xargs when processing a manifest,
+    // when one fails, xargs continues to plow through the rest
+    // before finally erroring-out the entire pipeline, so instead
+    // we `xargs cat` the files, and pipe the output into the decompressor.
+
+    // single-enquote path for passing to shell.
+    path = "'" + str::replace(std::move(path), "'", "'\\''") + "'";
+
+    if (is_manifest_file) {
+        // Using awk to filter out empty and #-lines from manifest
+        // because grep returns non-zero retcode if it doesn't find matching lines.
+        return std::make_unique<pipe_istream>(
+            "set -eo pipefail; cat " + path 
+          + " | awk '!/^($|#)/' | xargs -n1 cat "
+          + (decompressor_cmd.empty() ? "" : " | " + decompressor_cmd + pv_cmd)
+        );
+    } else if (decompressor_cmd != "") { // single compressed file
+        return std::make_unique<pipe_istream>(decompressor_cmd + " < " + path + pv_cmd);
+    } else {
+        return ifstr;
+    }
 }

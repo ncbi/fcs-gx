@@ -30,7 +30,9 @@
 #include "seq_info.hpp"
 #include "subbyte_array.hpp"
 #include "segment.hpp"
+#include "ext/json5.hpp"
 
+#include <set>
 #include <numeric>
 #include <unordered_set>
 #include <fstream>
@@ -42,6 +44,7 @@ using namespace gx;
 using fn::operators::operator%; // see fn.hpp
 using fn::operators::operator%=;
 using fn::operators::operator<<=;
+namespace tsv = rangeless::tsv;
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -140,6 +143,20 @@ static ivls_t get_indexable_intervals(
     return ivls;
 }
 
+
+static ivls_t get_exon_intervals(const fasta_seq_t& inp_chunk, const locs_map_t& exon_locs_map)
+{
+    // neighborhoods around exons are more conserved, so will dilate them by 20bp.
+    const auto whole_chunk_ivl = ivl_t{ (int32_t)inp_chunk.offset + 1, (int32_t)inp_chunk.seq.size() };
+    const auto dilate_exon_fn  = L(ivl_t::intersect(ivl_t::dilate(_, 20), whole_chunk_ivl));
+    const auto& exons_for_id   = at_or_default(exon_locs_map, inp_chunk.seq_id);
+
+    return ivl_t::get_overlapping_v(exons_for_id, whole_chunk_ivl)
+         % fn::transform(dilate_exon_fn)
+         % fn::where L(_.len >= CIndex::k_word_tlen)
+         % fn::to_vector();
+}
+
 // Extract gene symbol [gene=...] from fasta deflines as formatted in from *cds_from_genomic.fna.gz files.
 // Return empty string if can't parse the gene symbol.
 static std::string get_gene_symbol_from_defline(const std::string& defline)
@@ -172,24 +189,34 @@ void gx::MakeDb(     std::istream& fasta_istr,
                      std::istream* taxa_istr_ptr,
                      std::istream* hardmask_istr_ptr,
                      std::istream* softmask_istr_ptr,
+                     std::istream* exons_locs_istr_ptr,
                 const std::string& out_path) // /path/to/out_db.gxi
 {
-    auto get_num_locs = [](const locs_map_t& loc_map)
+    auto load_locs = [&](std::istream* istr_ptr, const char* label)
     {
-        return fn::cfrom(loc_map)
-             % fn::transform L(_.second.size()) 
-             % fn::foldl_d([](size_t ret, size_t n) { return ret + n; });
+        auto locs_map = istr_ptr ? LoadLocsMap(*istr_ptr) : locs_map_t{};
+
+        size_t sum_lens = 0;
+        for (const auto& kv : locs_map)
+            for (const auto& ivl : kv.second)
+                if (ivl.len != k_max_seq_len) // exclude whole-seq
+        {
+            sum_lens += ivl.len;
+        }
+
+        if (istr_ptr) {
+            std::cerr << "Loaded "    << label
+                      << " loc-map: " << sum_by(locs_map, L(_.second.size()))
+                      << " locs; "    << sum_lens
+                      << " bp.\n";
+        }
+
+        return locs_map;
     };
 
-    const auto hardmask_map = hardmask_istr_ptr ? LoadLocsMap(*hardmask_istr_ptr) : locs_map_t{};
-    if (hardmask_istr_ptr) {
-        std::cerr << "Loaded hardmask map: " << get_num_locs(hardmask_map) << " locs.\n";
-    }
-
-    const auto softmask_map = softmask_istr_ptr ? LoadLocsMap(*softmask_istr_ptr) : locs_map_t{};
-    if (softmask_istr_ptr) {
-        std::cerr << "Loaded softmask map: " << get_num_locs(softmask_map) << " locs.\n";
-    }
+    const auto hardmask_map  = load_locs(  hardmask_istr_ptr, "hardmask");
+    const auto softmask_map  = load_locs(  softmask_istr_ptr, "softmask");
+    const auto exon_locs_map = load_locs(exons_locs_istr_ptr, "exons"   );
 
     /////////////////////////////////////////////////////////////////////////
 
@@ -197,7 +224,6 @@ void gx::MakeDb(     std::istream& fasta_istr,
     const auto id_tax_vec = id_tax_vec_t{ [&]
     {
         auto ret = id_tax_vec_t{};
-        namespace tsv = rangeless::tsv;
         ConsumeMetalineHeader(seq_id2tax_id_istr, GX_TSV_HEADER__SEQ_ID_MAPPING);
         for (const tsv::row_t& row : tsv::from(seq_id2tax_id_istr)) {
             VERIFY(row.size() == 2);
@@ -316,30 +342,28 @@ void gx::MakeDb(     std::istream& fasta_istr,
 
     /////////////////////////////////////////////////////////////////////////
 
-    CIndex index{};
 
     std::atomic_size_t num_bases_in_scope = {};
 
+    static const std::set<tax_id_t> large_genome_taxa =
+        get_env("GX_LARGE_GENOME_TAXA", std::string{})
+      % tsv::split_on_delim(',')
+      % fn::where L(_ != "")
+      % fn::transform L(tax_id_t{ tsv::to_num(_) })
+      % fn::to(std::set<tax_id_t>());
+
+    static constexpr auto dense_stride = 7; // for viruses, proks, exons, CDSes, repeats, human
+    static constexpr auto euk_stride = dense_stride * 2; // NB: must be multiple of dense_stride
+
+    CIndex index{ dense_stride };
+
+    static const auto large_genome_stride = get_env("GX_LARGE_GENOME_STRIDE", euk_stride * 2);
+    VERIFY(large_genome_stride % 3 != 0 && large_genome_stride >= euk_stride * 2);
+
     // will be doing this part in parallel
-    auto update_index_and_translate_to2bit =
-        [&](fasta_seq_t inp_chunk) -> std::pair<fasta_seq_t, sbj_seq_t>
+    auto update_index_and_translate_to2bit = [&](fasta_seq_t inp_chunk)
+      -> std::pair<fasta_seq_t, sbj_seq_t>
     {
-        const bool is_in_frame_CDS =  // GP-34257
-            str::contains(inp_chunk.seq_id, "cds_")
-         && (   str::startswith(inp_chunk.seq, "ATG")
-             || (   inp_chunk.seq.size() % 3 == 0
-                 && (   str::endswith(inp_chunk.seq, "TAA")
-                     || str::endswith(inp_chunk.seq, "TAG")
-                     || str::endswith(inp_chunk.seq, "TGA"))));
-
-        // Will use small k_stride for proks, and 2*k_stride for euks
-        // to give more sensitivity to proks.
-        const auto tax_id = seq_infos.at(inp_chunk.seq_oid).tax_id;
-        const auto stride =
-            is_in_frame_CDS ? 18  // multiple of 3 - frame-preserving; otherwise frame-rotating.
-          : CIndex::k_stride * (tax_map.count(tax_id) && tax_map.at(tax_id).is_prok_or_virus() ? 1 : 2);
-
-
         // Apply hardmasking.
         const auto whole_chunk_ivl = ivl_t{ (int32_t)inp_chunk.offset + 1, (int32_t)inp_chunk.seq.size() };
         for (const auto& ivl : at_or_default(hardmask_map, inp_chunk.seq_id))
@@ -349,27 +373,68 @@ void gx::MakeDb(     std::istream& fasta_istr,
             inp_chunk.seq[i - 1 - inp_chunk.offset] = 'N';
         }
 
-        const auto ivls = get_indexable_intervals(inp_chunk, softmask_map, hardmask_map);
-        num_bases_in_scope += sum_by(ivls, L(_.len));
+#if 0
+        const bool is_in_frame_CDS =  // GP-34257
+            str::contains(inp_chunk.seq_id, "cds_")
+         && (   str::startswith(inp_chunk.seq, "ATG")
+             || (   inp_chunk.seq.size() % 3 == 0
+                 && (   str::endswith(inp_chunk.seq, "TAA")
+                     || str::endswith(inp_chunk.seq, "TAG")
+                     || str::endswith(inp_chunk.seq, "TGA"))));
+#endif
 
-        for (const auto& ivl : ivls) {
-            const size_t start = size_t(ivl.pos      - 1) - inp_chunk.offset; // 0-based chunk-local coordinate
-            const size_t end   = size_t(ivl.endpos() - 1) - inp_chunk.offset; // 0-based chunk-local coordinate
-            VERIFY(start < inp_chunk.seq.size());
+        // Will use smaller stride for proks, viruses, CDS-regions, exons, and human genome.
+        const auto tax_id           = seq_infos.at(inp_chunk.seq_oid).tax_id;
+        const auto& tax_info        = at_or_default(tax_map, tax_id);
+        const bool is_prok_or_virus = tax_info.is_prok_or_virus();
+        const bool is_human         = +tax_id == 9606;
+        const bool is_cds           = str::startswith(inp_chunk.seq_id, "cds_");
+        const bool is_repeat        = str::startswith(inp_chunk.seq_id, "lcl|repeat.");
+        const bool is_large_genome  = large_genome_taxa.count(tax_id);
+        const auto exon_ivls        = get_exon_intervals(inp_chunk, exon_locs_map);
+        const auto other_ivls       = get_indexable_intervals(inp_chunk, softmask_map, hardmask_map);
+        num_bases_in_scope         += sum_by(other_ivls, L(_.len));
 
-            for(auto kmer = kmer_ci_t(inp_chunk.seq, CIndex::k_word_tlen, start); kmer && kmer.i < end; ++kmer) {
-                size_t i_pos = inp_chunk.offset + kmer.i;
+        for (const auto ivls_ptr : { &exon_ivls, &other_ivls})
+            for (const auto& ivl : *ivls_ptr)
+        {
+            const bool is_exon = ivls_ptr == &exon_ivls;
 
-                if ((i_pos + 1 - CIndex::k_word_tlen) % stride != 0) {
-                    // Choosing positions where the word-start is in proper coding phase,
-                    // in case we are indexing a CDS with a frame-preserving %3==0 stride.
-                    continue;
+            const bool use_dense_stride = (is_exon || is_cds || is_prok_or_virus || is_human || is_repeat);
+
+            const auto stride = use_dense_stride ? dense_stride
+                              : is_large_genome  ? large_genome_stride
+                              :                    euk_stride;
+
+            VERIFY(ivl.pos > 0);
+            VERIFY(inp_chunk.offset <= size_t(ivl.pos - 1));
+            VERIFY(size_t(ivl.endpos() - 1) <= inp_chunk.offset + inp_chunk.seq.size());
+
+            const auto start_pos0 = size_t(ivl.pos - 1 - inp_chunk.offset);
+            const auto ivl_seq = std::string_view(inp_chunk.seq.data() + start_pos0, ivl.len);
+
+            auto last_inserted_i = size_t(-1);
+            process_kmers(ivl_seq, CIndex::k_word_tlen, [&](size_t i, kmer_bufs_t bufs)
+            {
+                i += start_pos0;       // convert from ivl-local coords to chunk-local
+                i += inp_chunk.offset; // convert from chunk-local to whole-query coords.
+
+                const auto hmer = CIndex::hmer38_t{ bufs.onebit };
+                const auto pos1 = as_pos1(i, CIndex::k_word_tlen, hmer.is_flipped);
+#if 0
+                // positional sampling
+                if (i % stride != 0) {
+                     return;
                 }
-
-                const auto hmer = CIndex::hmer38_t{ kmer.buf };
-                const auto pos1 = as_ivl(i_pos, CIndex::k_word_tlen, hmer.is_flipped).pos;
+#else
+                // pseudorandom sampling (but skip highly-overlapping)
+                if (hmer.hash() % stride != 0 || last_inserted_i + 3 >= i) {
+                    return;
+                }
+#endif
+                last_inserted_i = i;
                 index.insert(hmer, inp_chunk.seq_oid, pos1);
-            }
+            });
         }
 
         auto nuc2_seq = sbj_seq_t{ inp_chunk.seq };
@@ -441,6 +506,8 @@ void gx::MakeDb(     std::istream& fasta_istr,
     auto t = timer{};
 
     static const auto num_cores = get_env("GX_NUM_CORES", std::min(32U, std::thread::hardware_concurrency() - 1));
+    std::cerr << "Indexing using " << num_cores << " threads.\n";
+
     auto fasta_reader = MakeFastaReader(fasta_istr, k_chunk_stride, k_chunk_overlap);
     if (num_cores == 0) {
         // In num_cores==0 will do the entire processing using the simple loop, in-this-thread,
@@ -516,17 +583,18 @@ void gx::MakeDb(     std::istream& fasta_istr,
         char buf[128];
         strftime(buf, sizeof(buf), "%Y-%m-%d", std::localtime(&time_now));
 
+        auto j = json5::value_t{};
+        j["build-date"] = std::string{ buf };
+        j["seqs" ]      = json5::int_t(num_seqs);
+        j["Gbp"]        = float(num_bases)/1e9f;
+
         VERIFY(str::endswith(out_path, ".gxi"));
-        std::ofstream o_meta{ str::replace_suffix(out_path, ".gxi", ".meta.jsonl") };
-        o_meta << "{\"build-date\":\""  << std::string{ buf }
-               << "\", \"seqs\":"       << num_seqs
-               << ", \"Gbp\":"          << float(num_bases)/1e9f
-               << "}\n";
+        std::ofstream{ str::replace_suffix(out_path, ".gxi", ".meta.jsonl") } << j << "\n";
     }
 
     t = timer{};
     std::cerr << "Finalizing..." << std::endl;
-    index.finalize(seq_infos);
+    index.finalize(seq_infos, tax_map);
     std::cerr << "Finalized index in " << float(t)/60 << " minutes.\n\n";
 
     t = timer{};
@@ -538,9 +606,9 @@ void gx::MakeDb(     std::istream& fasta_istr,
     std::cerr << "Serialized index in " << float(t)/60 << " minutes.\n\n";
 
     t = timer{};
-    std::cerr << "Destroying..." << std::endl;
+    std::cerr << "Deallocating..." << std::endl;
     index = CIndex{};
-    std::cerr << "Destroyed index in " << float(t)/60 << " minutes.\n\n";
+    std::cerr << "Deallocated index in " << float(t)/60 << " minutes.\n\n";
 }
 
 

@@ -32,7 +32,12 @@ include_directories(${PROJECT_SOURCE_DIR}/include/)
 
 set_source_files_properties(main.cpp PROPERTIES COMPILE_FLAGS "-DGIT_REVISION=`../../build-support/git_describe.sh`")
 
-link_libraries("-flto -pthread -Wl,--format=binary -Wl,../../LICENSE -Wl,--format=default") # see show-license command in main.cpp
+link_libraries("-flto -Wl,--whole-archive -lrt -lpthread -Wl,--no-whole-archive -Wl,--format=binary -Wl,../../LICENSE -Wl,--format=default") # see show-license command in main.cpp
+# NB1: "-lrt" is a putative fix for linking error when building in bioconda (undefined reference to `clock_gettime')
+#
+# NB2: "-Wl,--whole-archive -lrt -lpthread -Wl,--no-whole-archive"
+# is required to avoid segfault when building in static mode in bioconda. Related: https://stackoverflow.com/a/59061684
+
 
 #add_compile_options(-fsanitize=address)
 #add_link_options(-fsanitize=address)

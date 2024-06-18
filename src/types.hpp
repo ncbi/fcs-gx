@@ -24,7 +24,7 @@
 #pragma once
 #include <string>
 #include <cctype>
-#include <map>
+#include <ext/unordered_dense.h>
 #include "util.hpp"
 
 namespace gx
@@ -80,31 +80,26 @@ public:
     {}
 };
 
+// for ankerl::unordered_dense::map
+struct seq_id_str_hash_t
+{
+    using is_avalanching = void;
+
+    auto operator()(const seq_id_str_t& x) const noexcept -> uint64_t
+    {
+        return uint64_hash(x.data(), x.size());
+    }
+};
+
+
 ///////////////////////////////////////////////////////////////////////
 
-
-#if defined(__GNUC__) && (__GNUC__ < 10)
-using seq_oid_t = uint32_t;
-#else
-// We would prefer to use the following instead:
 
 enum class seq_oid_t : uint32_t{};
 static inline uint32_t operator+(seq_oid_t seq_oid)
 {
     return (uint32_t)seq_oid;
 }
-
-// It compiles with unremovable false-positive warning in segment.hpp
-// 'gx::segment_t::s_oid' is too small to hold all values of 'enum class gx::seq_oid_t'
-// due to GCC bug https://gcc.gnu.org/bugzilla/show_bug.cgi?id=51242 (fixed in GCC-10)
-
-// So in we will use the weakly typed seq_oid_t = uint32_t,
-// but occasionally we want to complie in enum-class mode
-// to ensure type-correctness.
-//
-// Alternatively we could use uint32_t only within segment_t, but then
-// it results in explicit conversions mess.
-#endif
 
 enum class tax_id_t : uint32_t{};
 static inline uint32_t operator+(tax_id_t tax_id)
@@ -140,7 +135,7 @@ struct taxon_t
             || str::contains(gx_taxdiv, "virus");
     }
 };
-using tax_map_t = std::unordered_map<tax_id_t, taxon_t>;  // NB: plain std::map is perf-bottleneck in taxify.cpp
+using tax_map_t = ankerl::unordered_dense::map<tax_id_t, taxon_t>;  // NB: plain std::map is perf-bottleneck in taxify.cpp
 
 // if nullptr, return tax_map_t containing (tax_id_t{}, taxon_t { "NULL", "NULL", "NULL", "NULL", taxdiv_oid_t{}})
 tax_map_t LoadTaxa(std::istream* istr);
@@ -158,9 +153,27 @@ using pos1_t = int32_t;
 // (Not using uint32_t to avoid mixed-sign arithmetic with pos1_t)
 using len_t = int32_t;
 
+// GP-37757 - slightly smaller than 2^31-1 to allow some reserved values
+constexpr auto k_max_seq_len = len_t(2147483000);
+
+/////////////////////////////////////////////////////////////////////////////
+// Existence of an indexed word with this position shall indicate that
+// there exists a set of frequent words that were not indexed due to
+// being determined as belonging to a repeat-sequence.
+//
+// NB: reserved value outside of range of possible positions.
+constexpr auto k_frequent_hmer_marker = k_max_seq_len + 1;
+
+
 static inline pos1_t flip_pos1(pos1_t start, len_t len)
 {
     return 1 - start - len; // == (start+len-1)*-1, i.e. change start to stop and flip.
+}
+
+static inline pos1_t as_pos1(size_t pos0, len_t len, bool flip)
+{
+    const auto pos1 = pos1_t(pos0 + 1);
+    return flip ? flip_pos1(pos1, len) : pos1;
 }
 
 // convert to absolute 0-based array-pos
@@ -169,12 +182,6 @@ static inline size_t as_pos0(pos1_t pos)
     VERIFY(pos != 0);
     return (size_t)abs(pos) - 1;
 }
-
-/////////////////////////////////////////////////////////////////////////////
-// Existence of an indexed word with this position shall indicate that
-// there exists a set of frequent words that were not indexed due to
-// being determined as belonging to a repeat-sequence.
-static const pos1_t k_repeat_marker = 1000000000;
 
 
 /////////////////////////////////////////////////////////////////////////////
@@ -208,6 +215,20 @@ struct fasta_seq_t
     static na_t s_complement(na_t);
 };
 
+#if 0
+
+static inline bool is_overlapping_Ns(size_t pos, char na, size_t mer_len, size_t* last_N_pos)
+{
+    if (na == 'N' || na == 'n') {
+        *last_N_pos = pos;
+        return true;
+    } else {
+        return pos < *last_N_pos + mer_len;
+    }
+}
+
+// NB: superseded by process_kmers()
+//
 // A "cursor" that scans over 1-bit ({CT, AG} alphabet) sequence and maintains the 
 // recently seen bits in a 64-bit buf (current bit in lsb).
 // for (auto kmer = kmer_ci_t(qry.seq, CIndex::k_word_tlen); kmer; ++kmer) { ... }
@@ -237,7 +258,7 @@ struct kmer_ci_t
 
         do {
             ++(*this);
-        } while (i < offset + prefill_len);
+        } while (i < offset + prefill_len); // NB: should be offset + prefill_len - 1
     }
 
     explicit operator bool() const
@@ -258,6 +279,61 @@ struct kmer_ci_t
         }
     }
 };
+#endif
+
+struct kmer_bufs_t
+{
+    uint64_t onebit = 0; // 1-bit-coding k-mer in LSBs; len <= 64; {AG, CT}    -> {0, 1}
+    uint64_t twobit = 0; // 2-bit-coding k-mer in LSBs; len <= 32; {A, C, G T} -> {0, 1, 2, 3}
+};
+
+// Fn: (zero-based-kmer-start-pos, kmer_bufs_t) -> void
+template<typename IupacnaSeq, typename Fn>
+void process_kmers(const IupacnaSeq& seq, size_t mer_len, Fn fn)
+{
+    VERIFY(mer_len <= 64);
+
+    const auto hash_salt = uint64_hash(seq.size());
+
+    auto bufs        = kmer_bufs_t{};
+    auto last_N_pos  = int64_t(-1);
+
+    for (size_t i = 0; i < seq.size(); i++) {
+        auto na = seq[i];
+
+        if (na >= 'a' && na <= 'z') {
+            na -= ('a' - 'A'); // uppercase
+        }
+
+        VERIFY('A' <= na && na <= 'Z');
+        
+        const auto na2 = 
+            na == 'A' ? 0u
+          : na == 'C' ? 1u
+          : na == 'G' ? 2u
+          : na == 'T' ? 3u
+          : 0b11 & uint64_hash(bufs.twobit ^ i ^ hash_salt); 
+            // fill iupac ambiguity codes pseudorandomly
+
+        bufs.twobit = (bufs.twobit << 2) | na2;
+        bufs.onebit = (bufs.onebit << 1) | (na2 & 1u); // {AG, CT} -> {0, 1}
+
+        const auto start_pos = int64_t(i + 1 - mer_len);
+        if (na == 'N') {
+            last_N_pos = i;
+        } else if (
+            start_pos > last_N_pos             // K-mer exited N-run.
+            // NB: causes problems in tests - need to investigate
+            || (                               // Straggler-N:
+                0 < start_pos
+                && start_pos < last_N_pos      //     Inside k-mer, but not at start.
+                && seq[last_N_pos - 1] != 'N'  //     Not an N-run.
+            )
+        ) {
+            fn(start_pos, bufs);
+        }
+    }
+}
 
 
 

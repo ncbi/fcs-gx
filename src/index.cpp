@@ -26,6 +26,7 @@
 #include "types.hpp"
 #include "seq_info.hpp"
 #include "serial_util.hpp"
+#include "ext/json5.hpp"
 #include <mutex>
 #include <math.h>
 #include <algorithm>
@@ -51,12 +52,10 @@ struct key38_t
 
 void gx::CIndex::insert(const hmer38_t hmer, seq_oid_t seq_oid, pos1_t pos)
 {
-    ASSERT(!m_finalized);
-
+    VERIFY(hmer.hash() % m_pseudorandom_stride == 0);
     VERIFY(hmer.is_flipped == (pos < 0));
 
     const key38_t key{ hmer };
-
     auto& nodes = m_buckets[key.key30];
 
     // instead of locking the entire m_buckets, we only lock the subset of buckets
@@ -72,14 +71,55 @@ void gx::CIndex::insert(const hmer38_t hmer, seq_oid_t seq_oid, pos1_t pos)
 
 /////////////////////////////////////////////////////////////////////////////
 
-void gx::CIndex::finalize(const seq_infos_t& seq_infos)
+#if 0
+// for each sub-bucket, will keep nodes for `keep_n_taxa` tax-ids, selected pseudorandomly.
+// Here we compute threshold tax-id-hash; will keep nodes if their hashed-tax-id <= return-value
+//
+// TODO: when indexing, provide seq-id-list collated by taxa in the order of importance
+// (i.e. reference genomes first, more representative tax-ids first, etc.).
+// When culling taxa, keep higher-ranked.
+static auto get_thr_hashed_tax_id(
+        const fn::view<std::vector<gx::CIndex::node_t>::iterator> nodes, 
+        const seq_infos_t& seq_infos,
+        size_t keep_n_taxa = 20) -> uint64_t
 {
-    ASSERT(!m_finalized);
+    static thread_local auto hashed_tax_ids = std::vector<uint64_t>{};
+    hashed_tax_ids.clear();
+
+    for (const auto& node : nodes) {
+        const auto h = uint64_hash(+seq_infos.at(node.seq_oid).tax_id);
+        if (hashed_tax_ids.empty() || hashed_tax_ids.back() != h) {
+            hashed_tax_ids.push_back(h);
+        }
+    }
+
+    hashed_tax_ids %= fn::sort();
+    hashed_tax_ids %= fn::unique_adjacent();
+    hashed_tax_ids.resize(std::min(hashed_tax_ids.size(), keep_n_taxa));
+    return hashed_tax_ids.empty() ? 0 : hashed_tax_ids.back();
+};
+#endif
+
+
+void gx::CIndex::finalize(const seq_infos_t& seq_infos, const tax_map_t& taxa)
+{
+    for (const auto& si : seq_infos) {
+        try {
+            VERIFY(taxa.count(si.tax_id));
+        } catch (...) {
+            std::cerr << "tax-id not in taxa-map: id:" << si.get_seq_id() << "; tax_id:" << +si.tax_id << "\n";
+            throw;
+        }
+    }
 
     std::atomic_size_t nodes_total_pre_filter = {};
     std::atomic_size_t nodes_total_post_filter = {};
 
     static const auto num_threads = get_env("GX_NUM_CORES", std::min(32U, std::thread::hardware_concurrency() - 1));
+    static const auto keep_singleton_nodes = get_env("GX_KEEP_SINGLETON_NODES", false);
+
+    const auto is_node_repeat_specific = 
+        L( std::strncmp(seq_infos.at(_.seq_oid).get_seq_id(), "lcl|repeat.", 11) == 0 );
 
     for_each_in_parallel(m_buckets, num_threads, [&](nodes_t& bucket_nodes)
     {
@@ -90,6 +130,9 @@ void gx::CIndex::finalize(const seq_infos_t& seq_infos)
         bucket_nodes %= fn::unstable_sort();
         bucket_nodes %= fn::unique_adjacent(); // in case a seq was indexed twice
 
+        const auto subkey30 = uint64_t(&bucket_nodes - &m_buckets[0]);
+        VERIFY(subkey30 < m_buckets.size());
+
         // Keep few per-taxon.
         //
         // bucket nodes are sorted by:   (key8, value);
@@ -99,12 +142,72 @@ void gx::CIndex::finalize(const seq_infos_t& seq_infos)
         // threfore nodes are collated by (key8, tax-id).
 
         for_each_group_by( bucket_nodes,
-                           L(std::make_pair(_.subkey8, seq_infos.at( _.seq_oid ).tax_id)),
-                           [&](const auto subnodes_v) // having the same subkey8 and tax-id
+                           L(_.subkey8),
+                           [&](const auto subnodes_v)
         {
-            // Keep first few nodes for the key; mark rest for deletion by setting pos=0.
-            for(const auto it : irange{ subnodes_v.begin() + 2, subnodes_v.end() }) {
-                it->pos = 0;
+            // sanity-check
+            {
+                auto hmer = hmer38_t(0);
+                hmer.w = subkey30 | (uint64_t(subnodes_v.begin()->subkey8) << 30);
+                VERIFY(hmer.hash() % m_pseudorandom_stride == 0);
+            }
+
+            //const auto thr_hashed_tax_id = get_thr_hashed_tax_id(subnodes_v, seq_infos);
+
+            if (  !keep_singleton_nodes
+                && subnodes_v.size() == 1
+                && !taxa.at(seq_infos.at(subnodes_v.begin()->seq_oid).tax_id).is_prok_or_virus()
+            ) {
+                // this node is unique, meaning that corresponding h-mer is not well-conserved
+                // across multiple taxa, and has lower potential for matching.
+                // (does not apply to proks and viruses)
+                subnodes_v.begin()->pos = 0;
+            } else if (fn::exists_where(is_node_repeat_specific)(subnodes_v)) {
+                // if a node is represented in consensus-repeats, will drop all other positions.
+                for (auto& node : subnodes_v)
+                    if (!is_node_repeat_specific(node))
+                {
+                    node.pos = 0;
+                }    
+            } else {
+#if 0
+                static thread_local auto seen_taxdivs = std::vector<bool>{};
+                seen_taxdivs.clear();
+                seen_taxdivs.resize(256); // we have 68 taxdivs now (blast_names_mapping.tsv); might have more in the future
+#endif
+
+                for_each_group_by( subnodes_v,
+                                   L(seq_infos.at(_.seq_oid).tax_id),
+                                   [&](const auto taxon_nodes_v)
+                {
+#if 0
+                    const tax_id_t tax_id = seq_infos.at(taxon_nodes_v.begin()->seq_oid).tax_id;
+                    const taxon_t& taxon = taxa.at(tax_id);
+                    seen_taxdivs.at(+taxon.taxdiv_oid) = true;
+#endif
+
+#if 0
+                    const auto hashed_tax_id = uint64_hash(+tax_id);
+                    const auto keep_n        = hashed_tax_id <= thr_hashed_tax_id ? 2 : 0; // two per taxon, if taxon is selected
+#else
+                    static const auto keep_n = 2;
+#endif
+
+                    // Keep first keep_n nodes for the key; mark rest for deletion by setting pos=0.
+                    for(const auto it : irange{ taxon_nodes_v.begin() + keep_n, taxon_nodes_v.end() }) {
+                        it->pos = 0;
+                    }
+                });
+#if 0
+                if (const auto num_taxdivs = sum_by(seen_taxdivs, L(int(_))); num_taxdivs >= 5) {
+                    // too-non-specific - drop the positions and replace with k_frequent_hmer_marker
+                    for (auto& node : subnodes_v) {
+                        node.pos = 0;
+                    }
+                    subnodes_v.begin()->seq_oid = seq_oid_t{};
+                    subnodes_v.begin()->pos = k_frequent_hmer_marker;
+                }
+#endif
             }
         });
 
@@ -118,6 +221,29 @@ void gx::CIndex::finalize(const seq_infos_t& seq_infos)
     std::cerr << "Nodes pre-filter:" << nodes_total_pre_filter
               << "; nodes post-filter:" << nodes_total_post_filter
               << ".\n";
+}
+
+
+// this is for development, to assess distribution of bucket sizes.
+void CIndex::check_nodes(size_t n = 100000) const
+{
+    auto m = ankerl::unordered_dense::map<size_t, size_t>{};
+    size_t total = 0;
+    size_t num_nonempty = 0;
+    for (size_t i = 0; i < n; i++) {
+        const auto hmer = hmer38_t(uint64_hash(i ^ 123));
+        const auto nodes = this->at(hmer);
+        ++m[nodes.size()];
+        total += nodes.size();
+        num_nonempty += nodes.size() > 0;
+    }
+    
+    auto v = std::move(m) % fn::to_vector() % fn::sort();
+    std::cout << "##total=" << total << "; num_nonempty=" << num_nonempty << "\n";
+    std::cout << "#sub-bucket-size\tcount\n";
+    for (const auto& kv : v) {
+        std::cout << kv.first << "\t" << kv.second << "\n";
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////
@@ -178,6 +304,9 @@ gx::CIndex::nodes_view_t gx::CIndex::at(hmer38_t hmer) const
 {
     ASSERT(m_finalized);
 
+	const bool is_indexed = m_pseudorandom_stride == 1 
+                         || hmer.hash() % m_pseudorandom_stride == 0;
+
     const key38_t key{ hmer };
 
     VERIFY((m_subcounts32 == nullptr) == (m_nodes_ptr == nullptr));
@@ -189,20 +318,17 @@ gx::CIndex::nodes_view_t gx::CIndex::at(hmer38_t hmer) const
 
                           : nodes_view_t{ m_buckets[key.key30].data(),
                                           m_buckets[key.key30].data() + m_buckets[key.key30].size() };
-    auto begin_end =
-#if BRANCHLESS_EQUAL_RANGE
-            branchless::equal_range(
-#else
-            std::equal_range(
-#endif
+
+    auto begin_end = !is_indexed ?
+            std::make_pair(nodes_view.end(), nodes_view.end())
+          : std::equal_range(
                  nodes_view.begin(), nodes_view.end(),
                  node_t{ seq_oid_t{}, pos1_t{}, key.key8 },
                  BY(_.subkey8));
-
-    // If no hits, return close neighbors (ignoring subkey8 entirely, or lower bits thereof)
-
-    if (begin_end.first != begin_end.second) {
-        ; // have some hits
+    
+    static const bool s_enable_approx_hits = get_env("GX_ENABLE_APPROX_HITS", false);
+    if (begin_end.first != begin_end.second || !s_enable_approx_hits) {
+        ; // have some exact hits, or approx-mode disabled
     } else if (nodes_view.end() - nodes_view.begin() <= 8) {
 
         // have few hits
@@ -299,8 +425,13 @@ gx::CIndex::nodes_view_t gx::CIndex::at(hmer38_t hmer) const
 /////////////////////////////////////////////////////////////////////////
 
 using db_version_t = uint32_t;
-static const db_version_t k_exec_db_version = 100;
+static const db_version_t k_exec_db_version = 200;
 // lower two digits is the minor-version.
+//
+// 2024-04-24 - bumped version from 100 to 200, because we now append 
+// json with auxiliary params, and the streampos check in align.cpp will 
+// fail if it sees a gx-db with unread data in the footer (with old code
+// that doesn't know about the json-footer).
 
 static const uint64_t k_file_magic_constant = 0xdad9083c0340076c; // random
 
@@ -335,6 +466,13 @@ void CIndex::to_stream(std::ostream& ostr) const
         // but as simple concatenatino of nodes.
         ser::to_stream(ostr, nodes.data(), nodes.size());
     }
+
+    // JSON with extra params (added in Apr 2024)
+    {
+        auto j = json5::value_t();
+        j["pseudorandom-stride"] = json5::int_t(m_pseudorandom_stride);
+        ostr << j;
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////
@@ -347,8 +485,11 @@ void CIndex::from_stream(std::istream& istr)
     }
 
     const db_version_t db_version = ser::from_stream(istr);
-    if (db_version/100 != k_exec_db_version/100) {
-        GX_THROW("The version of the index is incompatible with the executable.");
+    if (db_version/100 > k_exec_db_version/100) {
+        GX_THROW(
+              "The version of the index ("              + std::to_string(db_version) 
+            + ") is incompatible with the executable (" + std::to_string(k_exec_db_version)
+            + ").");
     }
 
     ser::skip_padding(istr);
@@ -395,8 +536,19 @@ void CIndex::from_stream(std::istream& istr)
         m_nodes_ptr = reinterpret_cast<const node_t*>(memistr_p->begin() + memistr_p->tellg());
 
         const auto num_nodes = x_subcount(k_num_buckets - 1);
+        //std::cerr << "num_nodes: " << num_nodes << "\n";
 
         memistr_p->seekg((const char*)(m_nodes_ptr + num_nodes) - memistr_p->begin());
+    }
+
+    const auto tellg = istr.tellg();
+    if (istr.peek() != EOF && !istr.eof()) {
+        // json-footer with extra params (not present in earlier versions of db).
+        auto j = json5::parse(istr);
+        m_pseudorandom_stride = (size_t)j["pseudorandom-stride"].get<json5::int_t>();
+    } else {
+        istr.seekg(tellg); // to prevent breaking the check in align.cpp that tellg() == size of .gxi
+        m_pseudorandom_stride = get_env("GX_PSEUDORANDOM_STRIDE", 1u); // for backward compatibility with old dbs.
     }
 
     m_finalized = true;

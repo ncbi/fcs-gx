@@ -33,7 +33,7 @@ using fn::operators::operator%=;
 using fn::operators::operator<<=;
 
 
-const ivl_t ivl_t::s_whole_ivl = ivl_t{ 1, 2000000000 };
+const ivl_t ivl_t::s_whole_ivl = ivl_t{ 1, k_max_seq_len };
 
 auto gx::LoadLocsMap(std::istream& istr) -> locs_map_t
 {
@@ -715,5 +715,34 @@ static const bool test1 = []
     VERIFY((irhs == ivls_t{ {10,0}, {14,5}, {23,1}, {25,0} }));
     VERIFY(ivl_t::invert(irhs) == rhs);
 
+    return true;
+}();
+
+// Dilate interval if not empty, up to 0-boundary.
+ivl_t ivl_t::dilate(ivl_t ivl, len_t ext)
+{
+    const bool do_flip = ivl.pos < 0;
+    if (do_flip) {
+        // flip into positive orientation, then dilate, and will flip back below.
+        ivl.pos = flip_pos1(ivl.pos, ivl.len);
+    }
+
+    if (ivl.pos > 0) {
+        const auto ext_left = std::min(ivl.pos - 1, ext);
+        ivl.pos -= ext_left;
+        ivl.len += ext_left + ext;
+    }
+
+    if (do_flip) {
+        ivl.pos = flip_pos1(ivl.pos, ivl.len);
+    }
+
+    return ivl;
+}
+
+static const bool s_test_dilate = []
+{
+    VERIFY(( ivl_t::dilate(ivl_t{ 5,   5 }, 10) == ivl_t{ 1,   19 } ));
+    VERIFY(( ivl_t::dilate(ivl_t{ -10, 5 }, 10) == ivl_t{ -20, 20 } ));
     return true;
 }();

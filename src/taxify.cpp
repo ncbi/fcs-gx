@@ -25,10 +25,15 @@
 
 #include "types.hpp"
 #include "segment.hpp"
+#include "serial_util.hpp"
+#include "ext/json5.hpp"
 
 #include <set>
 #include <cmath>
 #include <smmintrin.h>
+#include <string_view>
+#include <iomanip>
+
 
 using namespace gx;
 
@@ -36,25 +41,57 @@ using fn::operators::operator%; // see fn.hpp
 using fn::operators::operator%=;
 using fn::operators::operator<<=;
 
+
+// delim -> (line -> ref<vec<string_view>>)
+// NB: return values are bound to the lifetime of `line`.
+static auto split_on_delim(const char delim)
+{
+    return [delim, ret = std::vector<std::string_view>()](const std::string& line) mutable 
+        -> std::reference_wrapper<std::vector<std::string_view>>
+    {
+        ret.clear();
+        size_t start = 0;
+
+        for (size_t end = line.find(delim);
+             end != std::string::npos;
+             end = line.find(delim, start))
+        {
+            ret.emplace_back(line.data() + start, end - start);
+            start = end + 1;
+        }
+
+        ret.emplace_back(line.data() + start, line.size() - start);
+        return std::ref(ret);
+    };
+}
+
 /////////////////////////////////////////////////////////////////////////////
 
 // GP-33388
-struct repeat_tracks_t
+struct special_tracks_t
 {
     ivls_t transposons;     // transposons from query-genome.
     ivls_t low_complexity;  // low-entropy regions.
     ivls_t ultraconserved;  // regions covered by hits from at least 5 distinct non-prok divs.
     ivls_t n_runs;          // spans of Ns.
-    ivls_t combined;        // Union of the above.
+
+    ivls_t all_repeats;     // Union of the above.
+
+    enum class xc_t { mito, plastid, plasmid, none }; // extrachromosomal types
+    ivls_t extrachromosomals[3]; // mito, plastid, plasmid respectively
 
     void finalize()
     {
-        combined.clear();
+        for (size_t i = 0; i < (size_t)xc_t::none; i++) {
+            ivl_t::sort_and_merge(extrachromosomals[i]);
+        }
+
+        all_repeats.clear();
         for (const auto p : { &transposons, &low_complexity, &ultraconserved, &n_runs }) {
             ivl_t::sort_and_merge(*p);
-            combined <<= std::as_const(*p);
+            all_repeats <<= std::as_const(*p);
         }
-        ivl_t::sort_and_merge(combined);
+        ivl_t::sort_and_merge(all_repeats);
 
         // make non-redundant. GP-33482
         // NB: this is relected in the repeats sub-columns order: (xp,lc,co,n).
@@ -66,7 +103,17 @@ struct repeat_tracks_t
 
     void clear()
     {
-        for (const auto p : { &transposons, &low_complexity, &ultraconserved, &n_runs, &combined }) {
+        for (const auto p : { 
+                &transposons, 
+                &low_complexity,
+                &ultraconserved,
+                &n_runs,
+                &all_repeats,
+                &extrachromosomals[0],
+                &extrachromosomals[1],
+                &extrachromosomals[2],
+             })
+        {
             p->clear();
         }
     }
@@ -266,8 +313,15 @@ public:
 
     void print(std::ostream& ostr, size_t top_n = 10) const
     {
+        ostr << std::right;
+
         ostr << "\n#top-divs by aggregate coverage (excluding repeats)\n";
-        ostr << "#\tis-primary\tcvg-len-nr\ttop-div-overlap-nr\tdiv\n";
+        ostr << "#"
+             << std::setw(11) << "is-primary"
+             << std::setw(16) << "cvg-len-nr"
+             << std::setw(20) << "top-div-overlap-nr"
+             << std::setw(32) << "div"
+             << "\n---------------------------------------------------------------------------------\n";
 
         const auto primary_divs = select_primary_divs();
 
@@ -278,10 +332,11 @@ public:
             const auto& stat = *it;
             const bool is_primary = std::count(primary_divs.begin(), primary_divs.end(), stat.div_oid);
             if (stat.cvg_len > 0 && (i++ < top_n || is_primary)) {
-                ostr << "\t" << (is_primary ? 'T' : 'F')
-                     << "\t" << stat.cvg_len_nr
-                     << "\t" << float(int(stat.get_frac() * 1000 + 0.5)) / 1000.0f
-                     << "\t" << stat.gx_taxdiv
+                ostr << ""
+                     << std::setw(11) << (is_primary ? 'T' : 'F')
+                     << std::setw(16) << str::format_as_si(double(stat.cvg_len_nr))
+                     << std::setw(20) << float(int(stat.get_frac() * 1000 + 0.5)) / 1000.0f
+                     << std::setw(32) << stat.gx_taxdiv
                      << "\n";
             }
         });
@@ -289,29 +344,31 @@ public:
     }
 
     // e.g. {"agg-cvg": 0.056, "asserted-div": "anml:crustaceans", "inferred-primary-divs": ["anml:crustaceans", "anml:insects"]}
-    std::string make_run_info_json(const std::string& asserted_div) const
+    json5::value_t make_run_info_json(const std::string& asserted_div) const
     {
-        const float agg_cvg = (float)this->m_aggregate_cvg_len/(float)m_genome_len;
+        const auto agg_cvg = (float)this->m_aggregate_cvg_len/(float)m_genome_len;
         VERIFY(agg_cvg <= 1);
-        auto ret = std::string{"{\"agg-cvg\": "} + std::to_string(agg_cvg);
+        auto ret = json5::value_t{};
+        ret["agg-cvg"] = agg_cvg;
+
         const auto is_asserted_div =
             L( _.gx_taxdiv == asserted_div || (asserted_div == "virs:viruses" && str::startswith(_.gx_taxdiv, "virs:"))); // GP-33387
 
-        if (!str::contains(asserted_div, "unknown") && asserted_div != "") {
-            if (!fn::exists_where(is_asserted_div)(m_stats) && !str::contains(asserted_div, "metagenome")) {
+        if (asserted_div != "") {
+            if (   !str::contains(asserted_div, "unknown")
+                && !str::contains(asserted_div, "metagenome")
+                && !fn::exists_where(is_asserted_div)(m_stats))
+            {
                 std::cerr << "\nWarning: asserted div '" + asserted_div + "' is not represented in the output!\n\n";
             }
-            ret += ", \"asserted-div\": \"" + asserted_div + "\"";
+            ret["asserted-div"] = asserted_div;
         }
 
-        ret += ", \"inferred-primary-divs\": [";
-        bool first = true;
+        ret["inferred-primary-divs"] = json5::array_t{};
         for (const taxdiv_oid_t primary_div : select_primary_divs()) {
-            ret += (first ? "\"" : ", \"") + m_stats[+primary_div].gx_taxdiv + "\"";
-            first = false;
+            ret["inferred-primary-divs"].get<json5::array_t>().push_back(m_stats[+primary_div].gx_taxdiv);
         }
 
-        ret += "]}";
         return ret;
     }
 };
@@ -612,8 +669,7 @@ static void process_ivl(
       const seq_id_str_t& qry_id,
               const len_t qry_len,
             const ivls_t& collapsed_all_track,
-   const repeat_tracks_t& repeat_tracks,
-            const ivls_t& xtrachr_track,
+  const special_tracks_t& special_tracks,
          const tax_map_t& tax_map,
             std::ostream& ostr)
 {
@@ -674,12 +730,16 @@ static void process_ivl(
         ostr << "~~" << div_ivl.pos << ".." << div_ivl.endpos()-1;
     }
 
+    using xc_t = special_tracks_t::xc_t;
+
     ostr << "\t" << div_ivl.len
-         << "\t" << get_overlap_len(repeat_tracks.transposons)
-         << ","  << get_overlap_len(repeat_tracks.low_complexity)
-         << ","  << get_overlap_len(repeat_tracks.ultraconserved)
-         << ","  << get_overlap_len(repeat_tracks.n_runs)
-         << ","  << get_overlap_len(xtrachr_track)
+         << "\t" << get_overlap_len(special_tracks.transposons)
+         << ","  << get_overlap_len(special_tracks.low_complexity)
+         << ","  << get_overlap_len(special_tracks.ultraconserved)
+         << ","  << get_overlap_len(special_tracks.n_runs)
+         << ","  << get_overlap_len(special_tracks.extrachromosomals[(size_t)xc_t::mito])
+         << ","  << get_overlap_len(special_tracks.extrachromosomals[(size_t)xc_t::plastid])
+         << ","  << get_overlap_len(special_tracks.extrachromosomals[(size_t)xc_t::plasmid])
          << "\t" << get_overlap_len(collapsed_all_track)
          << "\t|";
 
@@ -756,8 +816,7 @@ static void process_qry(
                      nodes_t& nodes,
           const seq_id_str_t& qry_id,
                   const len_t qry_len,
-             repeat_tracks_t& repeat_tracks,
-                      ivls_t& xtrachr_track,
+            special_tracks_t& special_tracks,
              const tax_map_t& tax_map,
                  div_stats_t& div_stats,
                 std::ostream& ostr)
@@ -805,17 +864,15 @@ static void process_qry(
         return ret;
     }();
 
-    repeat_tracks.ultraconserved = find_ultraconserved_intervals(qry_len, nodes, tax_map);
-    repeat_tracks.finalize();
-
-    ivl_t::sort_and_merge(xtrachr_track);
+    special_tracks.ultraconserved = find_ultraconserved_intervals(qry_len, nodes, tax_map);
+    special_tracks.finalize();
 
     // print_aggregate_scores_by_tax_ids(nodes);
 
     div_stats.m_genome_len += qry_len;
     div_stats.m_aggregate_cvg_len += ivl_t::sum_lens(collapsed_all_track);
 
-    const ivls_t div_ivls = find_div_intervals(nodes, repeat_tracks.combined, qry_len, tax_map, div_stats);
+    const ivls_t div_ivls = find_div_intervals(nodes, special_tracks.all_repeats, qry_len, tax_map, div_stats);
 
     if (div_ivls.size() <= 1) { // no hits (div_ivls is empty), or no chimeras (div_ivls.size() == 1)
         process_ivl(
@@ -824,8 +881,7 @@ static void process_qry(
             qry_id,
             qry_len,
             collapsed_all_track,
-            repeat_tracks,
-            xtrachr_track,
+            special_tracks,
             tax_map,
             ostr);
         return;
@@ -863,8 +919,7 @@ static void process_qry(
             qry_id,
             qry_len,
             collapsed_all_track,
-            repeat_tracks,
-            xtrachr_track,
+            special_tracks,
             tax_map,
             ostr
         );
@@ -994,10 +1049,10 @@ static void add_metaline_content(
 
     // verify that the out-file begins with expected meta-line
     {
-        auto ifstr = open_ifstream(out_path);
-        VERIFY(ifstr);
+        auto ifstr = ser::open_istream(out_path);
+        VERIFY(*ifstr);
         auto str = std::string( metaline.size(), ' ');
-        ifstr.read(str.data(), str.size());
+        ifstr->read(str.data(), str.size());
         VERIFY(str == metaline);
     }
 
@@ -1018,6 +1073,41 @@ static void add_metaline_content(
     auto ofstr = std::ofstream(out_path, std::ios::in | std::ios::out | std::ios::binary);
     VERIFY(ofstr);
     ofstr.write(metaline.data(), metaline.size());
+}
+
+using xc_t = special_tracks_t::xc_t;
+static auto load_extrachromosomal_ids(const std::string& path) -> std::map<seq_id_str_t, xc_t>
+{
+    auto ret = std::map<seq_id_str_t, xc_t>{};
+    std::ifstream ifstr{ path };
+    
+    if (!ifstr.good()) { // only present in newer dbs.
+        errno = 0;
+        return ret;
+    }
+
+    ConsumeMetalineHeader(ifstr, GX_TSV_HEADER__LOCS);
+    namespace tsv = rangeless::tsv;
+    for (const tsv::row_t& row : tsv::from(ifstr)) {
+        VERIFY(row.size() == 4);
+        VERIFY(row[1] == "." && row[2] == ".");
+
+        const auto id    = seq_id_str_t{ row[0] };
+        const auto& type = row[3];
+        const auto which = type == "mitochondrion" ? xc_t::mito
+                         : type == "plastid"       ? xc_t::plastid
+                         : type == "plasmid"       ? xc_t::plasmid
+                         :                           xc_t::none;
+        if (which == xc_t::none) {
+            GX_THROW("Unexpected extrachromosomal type in " + path + ": '" 
+                     + type + "' (for id=" + id + ")"
+                     + " - expected mitochondrion, plastid, or plasmid.");
+        }
+
+        ret[id] = which;
+    }
+
+    return ret;
 }
 
 
@@ -1048,19 +1138,17 @@ void gx::Taxify(
     auto current_qry_id    = seq_id_str_t{};
     auto qry_len           = len_t{ k_invalid_len }; // NB: not 0, GP-33468
     auto nodes             = nodes_t{};
-    auto repeat_tracks     = repeat_tracks_t{};
-    auto xtrachr_track     = ivls_t{}; // extrachromosomal: plastids, plasmids, mito
+    auto special_tracks    = special_tracks_t{};
     auto seen_queries      = std::set<seq_id_str_t>{};
 
     auto process_and_reset = [&](const seq_id_str_t& next_seq_id)
     {
-        process_qry(nodes, current_qry_id, qry_len, repeat_tracks, xtrachr_track, tax_map, div_stats, ostr);
+        process_qry(nodes, current_qry_id, qry_len, special_tracks, tax_map, div_stats, ostr);
 
         current_qry_id = next_seq_id;
         qry_len = k_invalid_len;
         nodes.clear();
-        repeat_tracks.clear();
-        xtrachr_track.clear();
+        special_tracks.clear();
 
         if (!seen_queries.insert(next_seq_id).second) {
             GX_THROW("Duplicate seq_id in in the input of `gx taxify`: " + next_seq_id);
@@ -1075,14 +1163,16 @@ void gx::Taxify(
         add_db_info(MakeMetaLine(GX_TSV_HEADER__PRE_TAXONOMY_RPT), db_path)
         + std::string(metaline_header_reserved_size, ' '); 
 
-    // (xp,lc,co,n,xc)-len:
+    // (xp,lc,co,n,mt,pt,pm)-len:
     //      xp: transposon-specific
     //      lc: low-complexity
     //      co: conserved across many divs
     //      n:  N-runs
-    //      xc: extrachromosomal (plastid|plasmid|mito)
+    //      mt: extrachromosomal, mitochondrion
+    //      pt: extrachromosomal, plastid
+    //      pm: extrachromosomal, plasmid
     ostr << metaline
-         <<  "\n#seq-id\tseq-len\t(xp,lc,co,n,xc)-len\tcvg-by-all\tsep1"
+         <<  "\n#seq-id\tseq-len\t(xp,lc,co,n,mt,pt,pm)-len\tcvg-by-all\tsep1"
              "\ttax-name-1\ttax-id-1\tdiv-1\tcvg-by-div-1\tcvg-by-tax-1\tscore-1"
                    "\tsep2\ttax-id-2\tdiv-2\tcvg-by-div-2\tcvg-by-tax-2\tscore-2"
                    "\tsep3\ttax-id-3\tdiv-3\tcvg-by-div-3\tcvg-by-tax-3\tscore-3"
@@ -1100,7 +1190,7 @@ void gx::Taxify(
     // ######################################################################
     const locs_map_t exclude_locs = [&]
     {
-        auto istr_opt = open_ifstream_opt(hardmask_locs_path);
+        auto istr_opt = ser::open_istream_opt(hardmask_locs_path);
         auto ret = istr_opt ? LoadLocsMap(*istr_opt) : locs_map_t{};
         for (const auto& kv : ret) {
             ivl_t::verify_regular(kv.second);
@@ -1120,20 +1210,26 @@ void gx::Taxify(
                );
     };
 
-    const locs_map_t extrachromosomal_locs = [&]
-    {
-        const auto path = str::replace_suffix(db_path, ".gxi", ".extrachromosomal.tsv");
-        std::ifstream ifstr{ path }; // only present in newer dbs.
-        return ifstr.good() ? LoadLocsMap(ifstr) : locs_map_t{};
-    }();
+    const std::map<seq_id_str_t, xc_t> extrachromosomal_ids =
+        load_extrachromosomal_ids(
+                str::replace_suffix(db_path, ".gxi", ".extrachromosomal.tsv"));
+
 
     // ######################################################################
 
 
     ConsumeMetalineHeader(istr, GX_TSV_HEADER__HITS);
-    //"#q-id\tq-pos1\ts-taxid\ts-id\ts-pos1\tlen\tmatchrun_L2\n";
     size_t row_num = 0;
-    for (const tsv::row_t& row : tsv::from(istr)) {
+
+#if 0
+    for (const tsv::row_t& row : tsv::from(istr))
+#else
+    // using faster string_view-based split_on_delim (defined earlier in TU).
+    using row_t = std::vector<std::string_view>;
+    for (const row_t& row : fn::seq(tsv::get_next_line(istr)) 
+                          % fn::transform(split_on_delim('\t')))
+#endif
+    {
         ++row_num;
 
         const auto execption_guard = make_exception_scope_guard([&]
@@ -1147,10 +1243,13 @@ void gx::Taxify(
 
         VERIFY(row.size() == 8);
 
-        const auto qry_seq_id =           seq_id_str_t(row[0]);
+        static thread_local auto qry_seq_id = seq_id_str_t{};
+        static thread_local auto sbj_seq_id = seq_id_str_t{};
+        qry_seq_id.assign(row[0]); // non-allocating, reusing qry_seq_id storage.
+        sbj_seq_id.assign(row[3]);
+
         const auto qry_start  =   (pos1_t) tsv::to_num(row[1]);
         const auto sbj_tax_id = (tax_id_t) tsv::to_num(row[2]);
-        const auto sbj_seq_id =           seq_id_str_t(row[3]);
         const auto sbj_start  =   (pos1_t) tsv::to_num(row[4]);
         const auto len        =    (len_t) tsv::to_num(row[5]);
         const auto l2_score   = (uint64_t) tsv::to_num(row[6]);
@@ -1174,15 +1273,15 @@ void gx::Taxify(
 
         } else if (sbj_seq_id == "_N_run") {
 
-            repeat_tracks.n_runs.push_back(ivl);
+            special_tracks.n_runs.push_back(ivl);
 
         } else if (sbj_seq_id == "_transposon") {
 
-            repeat_tracks.transposons.push_back(ivl);
+            special_tracks.transposons.push_back(ivl);
 
         } else if (sbj_seq_id == "_low_complexity") {
 
-            repeat_tracks.low_complexity.push_back(ivl);
+            special_tracks.low_complexity.push_back(ivl);
 
         } else if (exclude_tax_ids.count(sbj_tax_id) || is_on_excludelist(sbj_seq_id, sbj_ivl)) {
             ;
@@ -1222,10 +1321,12 @@ void gx::Taxify(
             nodes.push_back(node_t{ ivl, sbj_tax_id, score });
 
 
-            if (   extrachromosomal_locs.count(sbj_seq_id)
+            if (   extrachromosomal_ids.count(sbj_seq_id)
                 && tax_map.at(sbj_tax_id).gx_taxdiv == asserted_div)
             {
-                xtrachr_track.push_back(ivl);
+                const xc_t type = extrachromosomal_ids.at(sbj_seq_id);
+                VERIFY(type != xc_t::none);
+                special_tracks.extrachromosomals[size_t(type)].push_back(ivl);
             }
         }
     }
@@ -1238,11 +1339,12 @@ void gx::Taxify(
         div_stats.print(std::cerr);
     }
 
+    const auto run_info_json_str = json5::to_string(div_stats.make_run_info_json(asserted_div));
     if (to_file) {
         ofstr.close();
-        add_metaline_content(metaline, out_path, "run-info", div_stats.make_run_info_json(asserted_div));
+        add_metaline_content(metaline, out_path, "run-info", run_info_json_str);
     } else if(verbose) {
         std::cerr << "\nNote: the output-stream of taxify is stdout - will not add run-info to the meta-line header.\n"
-                  << "run-info:" << div_stats.make_run_info_json(asserted_div) << "\n\n";
+                  << "run-info:" << run_info_json_str << "\n\n";
     }
 }

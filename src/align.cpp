@@ -35,6 +35,7 @@
 #include "subbyte_array.hpp"
 #include "small_index.hpp"
 #include "ext/thread_pool.hpp"
+#include "ext/json5.hpp"
 
 #include <sstream>
 #include <fstream>
@@ -197,7 +198,7 @@ struct scores_t
                   const sbj_seq_t& sbj_seq,
                   const segment_t& seg)
     {
-        if (abs(seg.s) >= k_repeat_marker) {
+        if (abs(seg.s) > k_max_seq_len) {
             return; // special value - not a real seg
         }
 
@@ -232,9 +233,16 @@ struct prelim_align_ret_t
         ivls_t transposons;
 };
 
+#if 0
+static std::atomic_size_t s_cvg_by_seeds = 0;
+static auto s_print_cvg_by_seeds = make_scope_guard([](bool)
+{
+    std::cerr << ">>>>>>>>>> cvg_by_seeds:" << s_cvg_by_seeds << "\n";
+});
+#endif
+
 static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& index, const CTmasker& tmasker)
 {
-    auto elapsed = timer{};
     const size_t qry_len = qry.seq.size();
 
     /////////////////////////////////////////////////////////////////////////
@@ -249,17 +257,23 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
         is_flippeds.clear();
         is_flippeds.resize(qry_len);
 
-        for (auto kmer = kmer_ci_t(qry.seq, CIndex::k_word_tlen); kmer; ++kmer) {
-            const auto hmer     = CIndex::hmer38_t{ kmer.buf };
-            hitses[kmer.i]      = index.at(hmer);
-            is_flippeds[kmer.i] = hmer.is_flipped;
-        }
-    }
+        process_kmers(qry.seq, CIndex::k_word_tlen, [&](size_t i, const kmer_bufs_t& bufs)
+        {
+            if (i == 0) {
+                // There was a bug with kmer_ci_t that would skip the first word at i = 0;
+                // after switch to process_kmers, it causes drop in coverage in smoke-test,
+                // so or now here we'll skip the first word on purpose to preserve the 
+                // original behavior until I investigate further what's causing this.
+                return;
+            }
 
-    static thread_local std::ostringstream ostr{};
-    ostr.str("");
-    ostr << "Chunk length:" << qry.seq.size() << "\n";
-    ostr << "Initialized hitses in " << float(elapsed) << "s.\n";
+            i = i + CIndex::k_word_tlen - 1; // convert to stop-pos
+            const auto hmer = CIndex::hmer38_t{ bufs.onebit };
+
+            hitses[i]       = index.at(hmer);
+            is_flippeds[i]  = hmer.is_flipped;
+        });
+    }
 
     /////////////////////////////////////////////////////////////////////////
     // High occurrence intervals, having more than 10k hits in 20-bp window.
@@ -273,7 +287,7 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
         VERIFY(win_size <= CIndex::k_word_tlen);
 
         size_t count_in_window = 0;
-        for (const auto i : irange{ CIndex::k_word_tlen, hitses.size()} ) {
+        for (const auto i : irange{ CIndex::k_word_tlen, hitses.size() } ) {
             count_in_window += hitses[i].size();
             count_in_window -= i < win_size ? 0 : hitses[i - win_size].size();
 
@@ -282,8 +296,15 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
                 const auto pos = std::max(1, pos1_t(i + 1) - len);
                 ivl_t::push_or_merge(ret, ivl_t{ pos, len });
             }
+            
+            if (hitses[i].size() == 1 && hitses[i].begin()->pos == k_frequent_hmer_marker) {
+                const auto pos = pos1_t(i + 1 - CIndex::k_word_tlen);
+                ivl_t::push_or_merge(ret, ivl_t{ pos, CIndex::k_word_tlen });
+            }
         }
 
+        ivl_t::sort_and_merge(ret);
+        ret %= fn::where L(_.len > CIndex::k_word_tlen);
         return ret;
     }();
 
@@ -346,7 +367,7 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
             const nodes_view_t hits = hitses[i];
 
             for (const auto& h : hits)
-                if (h.pos != k_repeat_marker && hits.size() < max_occ_thr)
+                if (h.pos != k_frequent_hmer_marker && hits.size() < max_occ_thr)
             {
                 auto seg = segment_t{ q_pos, h.pos, h.seq_oid, CIndex::k_word_tlen };
                 seg.make_s_fwd();
@@ -365,12 +386,40 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
         filter.finalize();
     }
 
+#if 0
+    // for debugging.
+    {
+        Coalesce(segs);
+        for (auto& seg : segs) {
+            seg.make_q_fwd();
+        }
+        for (const auto& s : segs) {
+            std::cerr << s.to_string() << "\n";
+        }
+        return { std::move(segs), std::move(low_complexity_ivls), std::move(transposon_ivls) };
+    }
+#endif
+
 
     /////////////////////////////////////////////////////////////////////
 
     // Need to do another separate round of coalescing because the filter
     // can't do it 100% due to segs being expunged from the hotlist prematurely.
     Coalesce(segs);
+   
+#if 0 
+    // debugging
+    {
+        auto ivls = ivls_t{};
+        for (auto s : segs) {
+            s.make_q_fwd();
+            ivls.push_back(ivl_t{ s.q, s.len });
+        }
+        ivl_t::sort_and_merge(ivls);
+        s_cvg_by_seeds += ivl_t::sum_lens(ivls);
+    }
+#endif
+
     DropShadowedOnSbj(segs);
 
     // Another round of singleton dropping singleton for the same reason
@@ -426,12 +475,6 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
 
     /////////////////////////////////////////////////////////////////////////
 
-    static const bool do_print = get_env("GX_VERBOSE", false);
-    if (do_print) {
-        static std::mutex mut;
-        std::lock_guard<std::mutex> g{ mut };
-        std::cerr << ostr.str(); // Note: this will mess with std::ostream if multithreading.
-    }
 
     for (auto& seg : segs) {
         seg.make_q_fwd();
@@ -751,7 +794,6 @@ std::string add_db_info(std::string metaline, std::string db_path);
 
 std::string add_db_info(std::string metaline, std::string db_path)
 {
-    // NB: for not using open_ifstr_opt, as for now existence of .meta.jsonl is optional
     errno = 0;
     std::ifstream ifstr{ str::replace_suffix(db_path, ".gxi", ".meta.jsonl") };
     if (!ifstr) {
@@ -759,12 +801,9 @@ std::string add_db_info(std::string metaline, std::string db_path)
         return metaline;
     }
 
-    std::string line;
-    std::getline(ifstr, line);
-    VERIFY(!line.empty() && line.front() == '{' && line.back() == '}');
-
+    const auto j = json5::parse(ifstr);
     VERIFY(!metaline.empty() && str::endswith(metaline, "}]"));
-    metaline.insert(metaline.size() - 2, ", \"db\":" + line);
+    metaline.insert(metaline.size() - 2, ", \"db\": " + json5::to_string(j));
     return metaline;
 }
 
@@ -791,13 +830,21 @@ void gx::ProcessQueries(  const std::string& db_path,
     auto t = timer{};
     const auto sbj_infos = seq_infos_t(ser::from_stream(istr));
     const auto index     = CIndex(istr);
-    const auto tmasker   = CTmasker(repeats_fasta_path);
+    const auto tmasker   = CTmasker(ser::open_istream_opt(repeats_fasta_path).get());
+
+    static const size_t num_check_nodes = get_env("GX_CHECK_NODES", 0U);
+    if (num_check_nodes > 0) {
+        index.check_nodes(num_check_nodes);
+    }
 
     /////////////////////////////////////////////////////////////////////////
 
-    const tax_map_t taxa = LoadTaxa(open_ifstream_opt(
-                !taxa_path.empty() ? taxa_path
-                                   : str::replace_suffix(db_path, ".gxi", ".taxa.tsv")).get());
+    const tax_map_t taxa = LoadTaxa(
+        ser::open_istream(
+            !taxa_path.empty() ? taxa_path
+                               : str::replace_suffix(db_path, ".gxi", ".taxa.tsv")
+        ).get()
+    );
 
     // Verify the size of mmapped_db (.gxi) and mmapped_seq_db (.gxs), e.g. that files are not truncated.
     {
@@ -827,6 +874,7 @@ void gx::ProcessQueries(  const std::string& db_path,
 
     /////////////////////////////////////////////////////////////////////////
 
+    static const auto num_pagefaults_orig = ser::get_pagefault_count();
     size_t query_count = 0;
     size_t total_qry_bases = 0;
     auto output_result =
@@ -837,6 +885,14 @@ void gx::ProcessQueries(  const std::string& db_path,
         ,   partial_qry_len = 0UL
         , partial_qry_N_len = 0UL ](result_for_chunk_t res) mutable
     {
+        for (static bool printed_once = false;
+            !printed_once && ser::get_pagefault_count() > num_pagefaults_orig + 1000;
+            printed_once = true)
+        {
+            std::cerr << "\n\nNote: detected page-faults (disk-thrashing) - GX may run slowly.\n"
+                      << "Consider placing gxdb into non-swappable ramfs/tmpfs, or use `vmtouch -l`.\n\n";
+        }
+
         total_qry_bases += res.qry_chunk.seq.size();
 
         const auto execption_guard = make_exception_scope_guard([&]

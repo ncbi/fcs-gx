@@ -4,6 +4,7 @@ set -euo pipefail
 shopt -s expand_aliases
 alias awkt="awk -v FS='\t' -v OFS='\t'"
 alias sortt="sort -t$'\t'"
+which minigzip && alias gzip=$(which minigzip)
 
 inp=$1
 out_dir=gxdb_out
@@ -35,18 +36,35 @@ printf "##[[\"GX seq-id to tax-id mapping\",1,1]]\n" > $out_dir/seq_id-tax_id.ts
 cat $inp | while read line
 do
     fasta_path=$(printf "$line" | cut -f 6)
-    zcat -f $fasta_path |
+    cat $fasta_path |
+        gzip -d |
         grep -Po '^>\S+' |  # >seq_id
         perl -pae $shorten_cds_seq_ids_rx | 
         awkt -v line="$line" '1{ print substr($1,2),line }' | # seq-id, tax-id ...
         cut -f 1-2 >> $out_dir/seq_id-tax_id.tsv.tmp
 done
 
+
+# ---------------------------------------------------------------------------
+# GP-37029
+echo "Preparing exons map."
+cat $inp | cut -f6 |
+    sed 's/genomic.fna.gz/genomic.gff.gz/' | xargs cat | gzip -d |
+    grep -Pv '^#' | grep -P '\tCDS\t' |
+    cut -f 1,4,5 |  # seq-id, start, stop
+    sort -u |
+    sed '1i##[["GX locs",1,1]]' | # prepend header
+    gzip -c > $out_dir/exons.locs.gz
+
+
 # ---------------------------------------------------------------------------
 echo "Making db.{gxi,gxs}"
-cat $inp | cut -f 6 | xargs zcat -f | pv -Wbrat |
+cat $inp | cut -f 6 | xargs cat | gzip -d | pv -Wbrat |
     perl -pae $shorten_cds_seq_ids_rx | 
-    gx make-db --seq_id-tax_id=$out_dir/seq_id-tax_id.tsv.tmp --taxa=$out_dir/db.taxa.tsv --output=$out_dir/db.gxi
+    gx make-db --seq_id-tax_id=$out_dir/seq_id-tax_id.tsv.tmp \
+                        --taxa=$out_dir/db.taxa.tsv \
+                       --exons=$out_dir/exons.locs.gz \
+                      --output=$out_dir/db.gxi
 
 rm $out_dir/seq_id-tax_id.tsv.tmp
 

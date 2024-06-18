@@ -119,7 +119,6 @@ class Record:
     len             : int  # sequence length
     transposon_len  : int  # transposons coverage length
     repeat_len      : int  # low-complexity + conserved regions length
-    xtrachr_len     : int  # extrachromosomal coverage by asserted-div (plasmids, plastids, mito)
     cvg_by_all      : int  # coverage length by all alignments
     taxa            : List[Taxon] # len up-to 4, may be empty
     # fmt: on
@@ -131,16 +130,14 @@ class Record:
 
         assert len(row) >= 30 and row[4] == "|" and row[29] == "|"
 
-        lens = [int(s) for s in row[2].split(",")]  # [transposons, low-complexity, conserved, n-runs, extrachromosomal]
-        lens += [0] if len(lens) == 4 else []       # extrachromosomal is present only in newer outputs.
-        assert len(lens) == 5
+        lens = [int(s) for s in row[2].split(",")]  # [transposons, low-complexity, conserved, n-runs, mito, plastid, plasmid]
+        assert len(lens) >= 4
 
         return Record(
             row[0],                             # seq-id
             int(row[1]) - lens[3],              # seq-len excluding Ns
             lens[0],                            # transposons
             lens[1] + lens[2],                  # low_complexity + conserved
-            lens[4],                            # extrachromosomal
             int(row[3]),                        # cvg-by-all
             [Taxon.from_row(row, i) for i in [6, 12, 18, 24] if row[i + 1]]
         )
@@ -249,7 +246,7 @@ def classify_record(  # pylint: disable=R0913
 
     for div in divs:  # primary-div calls.
         if (   div in primary_divs
-            or is_metagenome and (is_prok(div) or is_vir_or_synt(div))
+            or is_metagenome and (is_prok(div) or (div.startswith("virs:") and t0.div != "synt:synthetic"))  # GP-37822
             or is_same_kdm and is_outlier_org  # Treat same-kingdom hits as primary-divs if outlier-org. GP-34615
         ):
             return (div, "primary-div")
@@ -272,8 +269,16 @@ def classify_record(  # pylint: disable=R0913
         return (t0.div, "same-kingdom-chimeric")
 
     # NB: GCA_900118605.1 (chlamydia) has cases of nematode-or-rodent calls (len(kdms)==2) that are both in contam_divs
-    elif (((t0.div in contam_divs and len(kdms) == 1) or all((d in contam_divs for d in divs)))
-        and (t0.score > 50 or (t0.score > min_score and is_high_cvg and not is_same_kdm))  # GP-35452
+    elif (
+        (
+               (t0.div in contam_divs and len(kdms) == 1)
+            or all((d in contam_divs for d in divs))
+            or t0.div == "synt:synthetic"  # GP-37822
+        )
+        and (
+            t0.score > 50
+            or (t0.score > min_score and is_high_cvg and not is_same_kdm)
+        )  # GP-35452
     ):
         return (t0.div, "contaminant(div)")
 
@@ -336,10 +341,21 @@ def select_divs(taxonomy_rpt: str, primary_div: str) -> List[str]:
 
 
     if os.getenv("GX_CLASSIFY_TAXONOMY_VERBOSE") and items:
+        widths = [15, 15, 15, 15, 9, 32]
+        def print_row(*row):
+            eprint(" | ".join(str(item).rjust(widths[i]) for i, item in enumerate(row)))
+
         eprint("\nTop represented putative divs:")
-        eprint("#\t", "coverage", "repeats_pct", "transposon_pct", "primary_div_pct", "div")
+        print_row("#coverage", "repeats_pct", "transposon_pct", "primary_div_pct", "is_select", "div")
+        eprint("--------------------------------------------------------------------------------------------------------------------")
+
         for div, v in items[:10]:
-            eprint("\t", as_readable(v[0]), *(as_pct(v[i] / v[0]) for i in (1, 2, 3)), "T" if select(v, div) else "F", div, sep="\t")
+            print_row(
+                as_readable(v[0]),
+                *(as_pct(v[i] / v[0]) for i in (1, 2, 3)),
+                "T" if select(v, div) else "F",
+                div
+            )
         eprint("")
 
     return [div for (div, v) in items if div == items[0][0] or select(v, div)]
@@ -347,6 +363,8 @@ def select_divs(taxonomy_rpt: str, primary_div: str) -> List[str]:
 
 #############################################################################
 def adjust_divs(species, asserted_div, inferred_primary_divs): # -> (primary_divs, contam_divs)
+    assert asserted_div
+
     contam_divs = []
     primary_divs = inferred_primary_divs.copy()
 
@@ -399,8 +417,9 @@ def adjust_divs(species, asserted_div, inferred_primary_divs): # -> (primary_div
         primary_divs = ["unkn:metagenomes"]
         contam_divs = vertebrates  # should be chordates, but close enough. What about "large" invertebrates?
 
-    elif asserted_div is None or asserted_div in primary_divs:
-        pass  # Normal case
+    elif asserted_div == "unkn:unknown" and primary_divs or asserted_div in primary_divs:
+        # NB: if primary_divs is empty, fall-through to the next rule. JIRA:GP-37686
+        pass
 
     elif (
         not primary_divs
@@ -431,12 +450,13 @@ def adjust_divs(species, asserted_div, inferred_primary_divs): # -> (primary_div
 
 #############################################################################
 def classify_taxonomy(args):
+    assert os.path.exists(args.taxonomy_rpt),  args.taxonomy_rpt
 
     metadata                  = get_metadata(args.taxonomy_rpt)
     run_info                  = metadata[1]["run-info"]
     agg_cvg_frac              = run_info["agg-cvg"]
     inferred_primary_divs     = run_info["primary-divs" if "primary-divs" in run_info else "inferred-primary-divs"]
-    asserted_div              = run_info.get("asserted-div", None)
+    asserted_div              = run_info.get("asserted-div", "unkn:unknown")
     species                   = args.species or run_info.get("species", None)
     primary_divs, contam_divs = adjust_divs(species, asserted_div, inferred_primary_divs)
     selected_divs             = select_divs(args.taxonomy_rpt, primary_divs[0]) if asserted_div != "unkn:metagenomes" else []
@@ -444,6 +464,7 @@ def classify_taxonomy(args):
 
     is_outlier_org = ( # GP-34615 - egregious contamination or "weird-bastie" - will treat same-kingdom divs as primary-divs.
         asserted_div
+        and asserted_div != "unkn:unknown"
         and inferred_primary_divs
         and asserted_div not in inferred_primary_divs
         and not is_same_kingdom(asserted_div, inferred_primary_divs[0])
@@ -488,11 +509,19 @@ def classify_taxonomy(args):
             assert "run-info" in metadata[1]
             metadata[0][0] = "GX taxonomy analysis report"
             metadata[1]["run-info"]["corrected-primary-divs"] = primary_divs  # GP-34560
+
             if species:
                 metadata[1]["run-info"]["species"] = species
+
+            if args.fasta_stats:
+                with open(args.fasta_stats, "r", encoding="utf8") as f:
+                    stats = json.load(f)
+                    metadata[1]["run-info"]["genome-hash"] = stats["hash"]
+
             print("##" + json.dumps(metadata), file=fout)
         elif isinstance(row, str) and row.startswith("#"):
             print(row.rstrip(), "reserved", "result", "div", "div_pct_cvg", sep="\t", file=fout)
+
         else:
             r = Record.from_row(row)
             (div, label) = classify_record(r, primary_divs, contam_divs, min_cvg_frac, is_outlier_org)
@@ -510,6 +539,7 @@ def main():
     )
 
     parser.add_argument("--in", dest="taxonomy_rpt", type=str, required=True, help="Output of gx taxify")
+    parser.add_argument("--fasta-stats", type=str, required=False, help="Fasta-stats json, output of gx get-fasta-stats")
     parser.add_argument("--species", type=str, required=False, help="Binomial species name from Taxonomy.")
     parser.add_argument("--out-dir", type=str, required=False, help="If specified, put the output in the file with the same basename in --out-dir; otherwise output to stdout.")
     classify_taxonomy(parser.parse_args())

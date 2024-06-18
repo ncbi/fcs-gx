@@ -175,7 +175,20 @@ struct str
         }
         return s;
     }
+
+    [[ nodiscard ]]
+    static inline std::string format_as_si(double num)
+    {
+        static const std::string prefixes = "PTGMK ";
+        auto s = std::string_view(prefixes);
+        while (s.size() > 0 && (num > 1000 || num < -1000)) {
+            num = num / 1000;
+            s = s.substr(0, s.size() - 1);
+        }
+        return std::to_string(float(num)) + " " + s.back();
+    }
 };
+
 
 /////////////////////////////////////////////////////////////////////////////
 // e.g. static const auto my_var = get_env("MY_VAR", 42);
@@ -318,6 +331,10 @@ auto make_vec_of_iterators(Container&& cont)
 // reverse-complement lower num_bits.
 uint64_t revcomp_bits(uint64_t buf, uint8_t num_bits);
 
+// reverse-complement 2-bit coding word (ACGT -> 0123) located in LSBs of buf.
+// word_len <= 32.
+uint64_t revcomp_twobits(uint64_t bufs, uint8_t word_len);
+
 // drop every third bit starting with 3'rd lsb
 uint64_t drop_every_3rd_bit(uint64_t buf);
 
@@ -448,26 +465,6 @@ auto make_exception_scope_guard(NullaryInvokable fn)
 
 /////////////////////////////////////////////////////////////////////////////
 
-static inline std::ifstream open_ifstream(const std::string& path)
-{
-    VERIFY(!errno);
-    auto ret = std::ifstream{ path };
-    if (!ret) {
-        errno = 0;
-        GX_THROW("Could not open file: " + path);
-    }
-    return ret;
-}
-
-static inline std::unique_ptr<std::ifstream> open_ifstream_opt(const std::string& path)
-{
-    VERIFY(path != "-");
-    return path.empty() ? std::unique_ptr<std::ifstream>{}
-                        : std::make_unique<std::ifstream>(open_ifstream(path));
-}
-
-/////////////////////////////////////////////////////////////////////////////
-
 
 #if RANGELESS_FN_ENABLE_PARALLEL
 template<typename Container, typename F>
@@ -524,6 +521,7 @@ void MakeDb( std::istream& fasta_istr,
              std::istream* taxa_istr,     // can be nullptr
              std::istream* hardmask_istr, // can be nullptr
              std::istream* softmask_istr, // can be nullptr
+             std::istream* exon_locs_istr,// can be nullptr
         const std::string& out_path);     // /path/to/out_db.gxi
 
 // Align queries against gxdb
@@ -547,6 +545,10 @@ void ApplyActionReport( std::istream& fasta_istr,
 // Split fasta on N-runs
 void SplitFasta(std::istream& fasta_istr, std::ostream& ostr);
 
+
+// Emit JSON: {"sum_len":23810896, "num_seqs":62, "num_Ns":178620, "len_N50":1484462, "hash":"8a33f16b6f6b7589"}
+void GetFastaStats(std::istream& fasta_istr, std::ostream& ostr);
+
 // Will verify that the stream starts with expected header (e.g. GX_TSV_HEADER__TAXA)
 // (ignoring minor version) and consume it from the stream (throw otherwise).
 std::string ConsumeMetalineHeader(std::istream& istr, std::string header);
@@ -567,5 +569,7 @@ fn::any_seq_t<fasta_seq_t> MakeFastaReader(
 std::string MakeProtsetMinhash(std::istream& prot_fasta);
 
 void PairwiseCompareMinHashes(std::istream& istr, std::ostream& ostr);
+
+void ExtractConsensusRepeats(const std::string& fasta_for_repeatdb_path, std::ostream& fasta_ostr);
 
 } // namespace gx

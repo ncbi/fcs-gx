@@ -183,7 +183,6 @@ result_labels_primary = { "primary-div", "primary-div(virus)", "transposon", }
 result_labels_contam = {
     "contaminant(human)", 
     "contaminant(div)",
-    "same-kingdom-chimeric",  # AA: apparently intentional; see Slack re: GCA_918807975.1 same-kingdom-chimeric
     "contaminant(virus)",
     "contaminant(cross-kingdom)",
     "contaminant(cross-div)",
@@ -194,6 +193,7 @@ result_labels_inconclusive = {
     "low-coverage",
     "inconclusive",
     "inconclusive(metagenome)",
+    "same-kingdom-chimeric",  # GP-36332
 }
 
 result_labels_valid = result_labels_primary | result_labels_contam | result_labels_inconclusive
@@ -244,7 +244,9 @@ class Record:
     result      : str
     div         : str
     div_pct_cvg : int
-    xtrachr_len : int  # raw extrachromoomal coverage (plastids, plasmids, mito)
+    xc_mt_len   : int  # extrachromosomal coverage, mitochondrion
+    xc_pt_len   : int  # extrachromosomal coverage, plastids
+    xc_pm_len   : int  # extrachromosomal coverage, plasmids
 
     orig_id     : str
     start_pos   : int
@@ -296,9 +298,9 @@ class Record:
         assert len(row) >= 30 and row[4] == "|" and row[29] == "|"
         assert row[31] in result_labels_valid
 
-        lens = [int(s) for s in row[2].split(",")]  # [transposons, low-complexity, conserved, n-runs, extrachromosomal]
-        lens += [0] * (5 - len(lens))               # pad to len=5 (extrachromosomal is present only in newer outputs).
-        assert len(lens) >= 5
+        lens = [int(s) for s in row[2].split(",")]  # [transposons, low-complexity, conserved, n-runs, mitos, plastisd, plasmids]
+        lens += [0] * (7 - len(lens))               # pad to len=7 (mitos,plastids,plasmids only present in newer outputs)
+        assert len(lens) >= 7
 
         rec = Record(
             seq_id      = row[0],
@@ -309,7 +311,9 @@ class Record:
             result      = row[31],
             div         = row[32],
             div_pct_cvg = int(row[33]),
-            xtrachr_len = lens[4],
+            xc_mt_len   = lens[4],
+            xc_pt_len   = lens[5],
+            xc_pm_len   = lens[6],
             orig_id     = "",
             start_pos   = 0,
             end_pos     = 0,
@@ -433,11 +437,12 @@ class Span:
 
     #########################################################################
     @staticmethod
-    def grey_side__GP_36740(left: Record, right: Record) -> Tuple[bool, str]:
+    def grey_side(left: Record, right: Record) -> Tuple[bool, str]:
         """
-        This is putative re-implementation of grey_side(...) below,
+        Re-implementation of grey_side(...) below,
         based on the following discussion in Slack:
         https://ncbi.slack.com/archives/C0277FK9FH7/p1697816519856089
+        Tested on GP-36740
 
         return (b:bool, s:str)
         where b = True if left is dominant based on raw-coverage(penalized-if-contam), else False
@@ -446,19 +451,8 @@ class Span:
         Note: definitions of G## from down below in this script:
         "G01": "group 'grey' rows with the high-coverage contaminant hits",
         "G02": "group 'grey' rows with the high coverage primary-div hits",
-        "G03": "group 'grey' rows with the contaminant, as default",  # NB: unused in this version
 
-
-        NB: Not sure if penalizing by 0.75 factor if contam is necessary
-        in get_weight() below.
-       
-        I added that based on the following comment in the above thread:
-        "or for a weak contam include the greys with the stronger primarys
-        ... and the 75% checks are because if it was just 
-        p.pident  > r.pident it would be fighting between a 49% and a 51%"
-        
-        So I interpret it as follows: For contam vs. primary case of 
-        about the same raw coverage (I presume 'r.pident' was a mistype),
+        For contam vs. primary case of about the same raw coverage,
         we want primary to 'win' - i.e. "greys" to be grouped with it,
         hence we need to penalize contam by some factor less than 1).
         """
@@ -473,57 +467,6 @@ class Span:
 
         return (left_is_dominant, "G01" if dominant_is_contam else "G02")
 
-
-    # The original grey_side() implementation is below, which is diverted to the above
-    # if enable_putative_fix is set. If the above implementation is approved,
-    # then the one below can be replaced for good.
-
-    #########################################################################
-    # assuming records ordered
-    #   p ... some greys ... r
-    # returns: True if the greys should be grouped with p
-    #          False if the greys should be grouped with r
-    @staticmethod
-    def grey_side(p: Record, r: Record, enable_putative_fix=int(os.getenv("GX_ACTION_REPORT_ENABLE_GP_36740", "0"))):
-
-        if enable_putative_fix:
-            return Span.grey_side__GP_36740(p, r)
-
-        pending_goes_early = False
-        rule = ""
-
-        if is_contam(p.result):  # p is contam and r is primary
-            if p.div_pct_cvg >= 75:
-                pending_goes_early = False
-                rule = "G01"
-
-            elif r.div_pct_cvg >= 75:
-                pending_goes_early = True
-                rule = "G02"
-
-            else:
-                pending_goes_early = False
-                rule = "G03"
-
-        else:  # p is primary-div, r is contam
-            if r.div_pct_cvg >= 75:
-                pending_goes_early = True
-                rule = "G01"
-
-            elif p.div_pct_cvg >= 75:
-                pending_goes_early = False
-                rule = "G02"
-
-            else:
-                pending_goes_early = True
-                rule = "G03"
-
-        dprint(f"    p: {p.result} : {p.div_pct_cvg}")
-        dprint(f"    r: {r.result} : {r.div_pct_cvg}")
-        dprint(f"  pending goes early: {pending_goes_early}")
-        dprint(f"   rule: {rule}")
-
-        return pending_goes_early, rule
 
     #########################################################################
     @staticmethod
@@ -1106,13 +1049,29 @@ class Sequence:
 
             dsprint(seq_id, f"825: id: {self.seq_id},  low_cov_mode: {low_cov_mode}, isk: {is_same_kingdom(primary_div_name, s.max_div_name)}, pdn: {primary_div_name}, mdn: {s.max_div_name}, mdc: {s.max_div_cov}, result={s.result}")
 
-
             if (  # GP-36649
                 is_primary(s.result)
                 and is_euk(primary_div_name)
-                and sum(r.xtrachr_len for span in spans for r in span.records) > 0.8 * seq_len
+                and sum(r.xc_mt_len for span in spans for r in span.records) > 0.8 * seq_len
+                and sum(r.xc_mt_len for span in spans for r in span.records) > sum(r.xc_pt_len for span in spans for r in span.records) # GP-36536
             ):
-                action_str = "ORGANELLE"
+                action_str = "MITOCHONDRION"
+                rule = "S04"  # Extrachromosomal coverage > 80% (plastid or mito)
+
+            elif (  # GP-36649
+                is_primary(s.result)
+                and is_euk(primary_div_name)
+                and sum(r.xc_pt_len for span in spans for r in span.records) > 0.8 * seq_len
+            ):
+                action_str = "PLASTID"
+                rule = "S04"  # Extrachromosomal coverage > 80% (plastid or mito)
+
+            elif (  # GP-36649
+                is_primary(s.result)
+                and is_prok(primary_div_name)
+                and sum(r.xc_pm_len for span in spans for r in span.records) > 0.8 * seq_len
+            ):
+                action_str = "PLASMID"
                 rule = "S04"  # Extrachromosomal coverage > 80% (plastid or mito)
 
             elif is_primary(s.result):
@@ -1165,8 +1124,8 @@ class Sequence:
                 action_str = "MEH"
                 rule = "S03"
 
-            if global_debug or action_str in ("EXCLUDE", "REVIEW", "REVIEW_RARE", "ORGANELLE", "INFO"):
-                if action_str in ("EXCLUDE", "REVIEW", "REVIEW_RARE", "ORGANELLE"):
+            if global_debug or action_str in ("EXCLUDE", "REVIEW", "REVIEW_RARE", "MITOCHONDRION", "PLASTID", "PLASMID", "INFO"):
+                if action_str in ("EXCLUDE", "REVIEW", "REVIEW_RARE"):
                     s.recalc_span_stats(global_top_contam_organism)
 
                 actions.append(

@@ -67,8 +67,7 @@ public:
     CTmasker(CTmasker&&) = default;
     CTmasker& operator=(CTmasker&&) = default;
 
-    CTmasker(const std::string& fasta_path); // can be empty
-    CTmasker(std::istream& fasta_istr);
+    CTmasker(std::istream* fasta_istr); // can be empty
 
 #if 1
     using counts_t = std::vector<uint8_t>;

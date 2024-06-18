@@ -4709,6 +4709,10 @@ namespace operators
 #include <cstdlib>
 #include <cstring>
 
+#if __has_include(<charconv>)
+#include <charconv>
+#endif
+
 namespace rangeless
 {
 namespace tsv
@@ -4943,51 +4947,112 @@ namespace tsv
           , m_end{ str.begin() == str.end() ? nullptr : &*str.begin() + str.size() }
         {}
 
-        /// Conversion to an enum or enum-class
-        template<typename Enum, typename std::enable_if<std::is_enum<Enum>::value>::type* = nullptr>
-        operator Enum() const && // rvalue-specific such that no possibility of m_beg/m_end becoming dangling
+        template<typename T> // arithmetic, or enum
+        operator T() const &&
         {
-            auto value = typename std::underlying_type<Enum>::type{};
-            value = std::move(*this);
-            return Enum(value);
-        }
+            if constexpr (std::is_enum_v<T>) {
+                return T(x_parse<typename std::underlying_type_t<T>>());
 
-        /// Conversion to an arithmetic type
-        template<typename Number, typename std::enable_if<std::is_arithmetic<Number>::value>::type* = nullptr>
-        operator Number() const &&
-        {
-            auto ret = Number{};
-            char* endptr = nullptr;
+            } else if constexpr(std::is_same_v<T, bool>) {
+                uint8_t ret = x_parse<uint8_t>();
+                throw_if(ret != 0 && ret != 1, ret, "Expected 0 or 1 for bool");
+                return ret;
 
-            errno = 0;
-            x_parse(ret, &endptr);
-
-            throw_if(errno,                      ret, "under-or-overflow");
-            throw_if(!endptr || endptr == m_beg, ret, "could not interpret");
-            throw_if(endptr > m_end,             ret, "parsed past the end");
-
-            for(; endptr < m_end; ++endptr) { // verify that there's no garbage past the end
-                throw_if(!std::isspace(*endptr), ret, "trailing non-whitespace characters");
+            } else {
+                return x_parse<T>();
             }
-            return ret;
-        }
-
-        /// Convert to `uint8_t` first; throw unless 0 or 1; return as bool.
-        operator bool() const &&
-        {
-            uint8_t ret = std::move(*this);
-            throw_if(ret != 0 && ret != 1, ret, "out of bounds");
-            return ret;
         }
 
     private:
-        const char* m_beg;
-        const char* m_end;
+
+#if __has_include(<charconv>)
+        template<typename Num>
+        Num x_parse() const
+        {
+            static_assert(std::is_arithmetic_v<Num>, "");
+
+            auto ptr = m_beg;
+            // Skip leading whitespace.
+            while (ptr < m_end && std::isspace(*ptr)) {
+                ++ptr;
+            }
+
+            // Skip leading '+'.
+            if (ptr < m_end && *ptr == '+') {
+                ++ptr;
+            }
+
+            auto x = Num{};
+            const auto result = std::from_chars(ptr, m_end, x);
+            
+            if (int(result.ec)) {
+                // NB: .message() below is expensive
+                throw_if(true, x, std::make_error_code(result.ec).message().c_str());
+            }
+
+            throw_if(result.ptr > m_end, x, "parsed past the end");
+
+            // Verify that there's no garbage past the end.
+            for (ptr = result.ptr; ptr && ptr < m_end; ++ptr) {
+                throw_if(!std::isspace(*ptr), x, "Trailing non-whitespace characters.");
+            }
+            return x;
+        }
+#else
+        template<typename Num>
+        Num x_parse() const
+        {
+            static_assert(std::is_arithmetic_v<Num>);
+
+            auto x = Num{};
+            char* endptr = nullptr;
+            errno = 0;
+
+
+            // todo: need to handle inf, nan?
+            if constexpr (std::is_same_v<Num, long double>) {
+                x = std::strtold(m_beg, &endptr);
+
+            } else if constexpr (std::is_same_v<Num,  double>) {
+                x = std::strtod(m_beg, &endptr);
+
+            } else if constexpr (std::is_same_v<Num, float>) {
+                x = std::strtof(m_beg, &endptr);
+
+            } else if constexpr (std::is_integral_v<Num> && std::is_signed_v<Num>) {
+                const auto num = std::strtoll(m_beg, &endptr, 10);
+                x = static_cast<Num>(num);
+                throw_if(x != num, x, "overflow");
+
+            } else {
+                static_assert(std::is_integral_v<Num> && std::is_unsigned_v<Num>, "");
+
+                auto ptr = m_beg;
+                while (ptr < m_end && std::isspace(*ptr)) {
+                    ++ptr;
+                }
+                throw_if(ptr < m_end && *ptr == '-', x, "negative number in unsigned conversion");
+
+                auto num = std::strtoull(ptr, &endptr, 10);
+                x = static_cast<Num>(num);
+                throw_if(x != num, x, "overflow");
+            }
+
+            throw_if(errno,                      x, "under-or-overflow");
+            throw_if(!endptr || endptr == m_beg, x, "could not interpret");
+            throw_if(endptr > m_end,             x, "parsed past the end");
+
+            for (; endptr < m_end; ++endptr) { // verify that there's no garbage past the end
+                throw_if(!std::isspace(*endptr), x, "trailing non-whitespace characters");
+            }
+            return x;
+        }
+#endif
 
         template<typename T>
         void throw_if(bool cond, const T&, const char* message) const
         {
-            if(cond) {
+            if (cond) {
                 throw std::domain_error(
                     "Can't parse '"
                   + std::string(m_beg, size_t(m_end-m_beg))
@@ -4996,49 +5061,8 @@ namespace tsv
             }
         }
 
-        void x_parse(long double& d, char** endptr) const
-        {
-            d = std::strtold(m_beg, endptr);
-        }
-
-        void x_parse(double& d, char** endptr) const
-        {
-            d = std::strtod(m_beg, endptr);
-        }
-
-        void x_parse(float& d, char** endptr) const
-        {
-            d = std::strtof(m_beg, endptr);
-        }
-
-        // NB: originally had two functions below as one function and
-        // chose dynamically how to parse based on std::is_signed<Integral>::value,
-        // but had to switch to static-dispatch to avoid the signed-vs-unsigned
-        // comparison warnings
-
-        template<typename Integral, typename std::enable_if<std::is_signed<Integral>::value>::type* = nullptr >
-        void x_parse(Integral& x, char** endptr) const
-        {
-            static_assert(std::is_integral<Integral>::value, "");
-            auto num = std::strtoll(m_beg, endptr, 10);
-            x = static_cast<Integral>(num);
-            throw_if(x != num, x, "overflow");
-        }
-
-        template<typename Integral, typename std::enable_if<std::is_unsigned<Integral>::value>::type* = nullptr >
-        void x_parse(Integral& x, char** endptr) const
-        {
-            static_assert(std::is_integral<Integral>::value, "");
-            auto ptr = m_beg;
-            while(ptr < m_end && std::isspace(*ptr)) {
-                ++ptr;
-            }
-            throw_if(ptr < m_end && *ptr == '-', x, "negative number in unsigned conversion");
-
-            auto num = std::strtoull(ptr, endptr, 10);
-            x = static_cast<Integral>(num);
-            throw_if(x != num, x, "overflow");
-        }
+        const char* m_beg;
+        const char* m_end;
     }; // to_num
 
 

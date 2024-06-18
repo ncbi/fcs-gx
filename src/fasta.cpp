@@ -31,6 +31,7 @@
 #include <set>
 #include <cctype>
 #include <sstream>
+#include <iomanip>
 
 using namespace gx;
 
@@ -225,6 +226,13 @@ static const bool test_extract_seq_id = []
     return true;
 }();
 
+static void check_max_supported_seq_len(const fasta_seq_t& inp)
+{
+    if (inp.offset + inp.seq.size() > k_max_seq_len) {
+        GX_THROW("Sequence too large. GX does not support fasta sequences longer than 2Gbp. Seq-id:" + inp.seq_id);
+    }
+}
+
 /////////////////////////////////////////////////////////////////////////////
 // Apped a fasta-line to next_inp, or set first defline.
 // Return false iff reached next defline.
@@ -248,6 +256,7 @@ static bool consume_fasta_line(const std::string& line, validate_iupacna_t valid
         }
 
         next_inp.seq += line;
+        check_max_supported_seq_len(next_inp);
 
         // uppercase all fasta
         for (const auto i : irange(next_inp.seq.size() - line.size(), next_inp.seq.size())) {
@@ -273,6 +282,8 @@ static fasta_seq_t extract_chunk(fasta_seq_t& next_inp, size_t chunk_size, size_
     auto ret_seq = iupacna_seq_t{ next_inp.seq.substr(0, chunk_size) };
     next_inp.seq.erase(0, chunk_stride);
     next_inp.offset += chunk_stride;
+
+    check_max_supported_seq_len(next_inp);
 
     return fasta_seq_t{
         next_inp.seq_id,
@@ -362,11 +373,98 @@ static size_t s_get_fasta_line_width(size_t seq_len)
     return s_fasta_line_width > 0 ? s_fasta_line_width : seq_len;
 }
 
+
+static ivls_t sample_chunks(ivls_t orig_ivls)
+{
+    static const auto sampling_chunk_len = get_env("GX_FASTA_SAMPLING_CHUNK_LEN", len_t{0});
+    VERIFY(sampling_chunk_len >= 0);
+
+    // inverse probability; will accept a chunk if random_uint % sampling_inv_prob == 0
+    static const auto sampling_inv_prob  = get_env("GX_FASTA_SAMPLING_INV_PROB", 5000ul);
+    VERIFY(sampling_inv_prob >= 1);
+
+    if (sampling_chunk_len == 0) {
+        return orig_ivls;
+    }
+
+    auto ivls = ivls_t{};
+    static uint64_t s_counter = 0;
+
+    for (const auto ivl : orig_ivls) {
+        if (ivl.len < sampling_chunk_len) {
+            continue;
+        }
+
+        for (len_t offset = ivl.len % sampling_chunk_len / 2;
+             offset + sampling_chunk_len <= ivl.len;
+             offset += sampling_chunk_len)
+        {
+            ++s_counter;
+            const auto random_uint = uint64_hash(s_counter ^ 12345ul);
+            if (random_uint % sampling_inv_prob == 0) {
+                ivls.push_back(ivl_t{ ivl.pos + offset, sampling_chunk_len });
+            }
+        }
+    }
+
+    return ivls;
+}
+
+// GP-37176
+void gx::GetFastaStats(std::istream& fasta_istr, std::ostream& ostr)
+{
+    size_t num_Ns    = 0;
+    size_t count     = 0;
+    size_t total_len = 0;
+    auto lens        = std::vector<size_t>{};
+    auto hashes      = std::vector<uint64_t>{};
+
+    for (auto fasta_seq : gx::MakeFastaReader(fasta_istr)) {
+        lens.push_back(fasta_seq.seq.size());
+        count += 1;
+        total_len += fasta_seq.seq.size();
+
+        hashes.push_back(uint64_hash(fasta_seq.seq.data(), fasta_seq.seq.size()));
+
+        for (const auto i : irange{ fasta_seq.seq.size() }) {
+            const auto c = fasta_seq.seq[i];
+            VERIFY('A' <= c && c <= 'Z');
+            num_Ns += c == 'N';
+        }
+    }
+
+    lens %= fn::sort();
+    const size_t len_N50 = [&]
+    {
+        size_t partial_sum = 0;
+        for (const auto len : lens) {
+            partial_sum += len;
+            if (partial_sum * 2 > total_len) {
+                return len;
+            }
+        }
+        return 0ul;
+    }();
+
+    hashes %= fn::sort();
+    hashes %= fn::unique_all();
+    const uint64_t aggregate_hash = uint64_hash(hashes.data(), hashes.size());
+
+    ostr << "{\"sum_len\":"   << total_len
+         << ", \"num_seqs\":" << count
+         << ", \"num_Ns\":"   << num_Ns
+         << ", \"len_N50\":"  << len_N50
+         << ", \"hash\":\""   << std::hex << std::setfill('0') << std::setw(16) << aggregate_hash << "\""
+         << "}\n";
+}
+
+
 // GP-31265
 void gx::SplitFasta(std::istream& fasta_istr, std::ostream& ostr)
 {
     static const auto min_n_run     = get_env("GX_FASTA_MIN_N_RUN"               , 10UL);
     static const auto min_chunk_len = get_env("GX_FASTA_MIN_REPORTABLE_CHUNK_LEN", 100UL);
+    static const auto add_bounds    = get_env("GX_FASTA_ADD_BOUNDS", true);
 
     auto ivls = ivls_t{};
     auto n_run = ivl_t{};
@@ -399,13 +497,18 @@ void gx::SplitFasta(std::istream& fasta_istr, std::ostream& ostr)
 
         const auto whole_ivl = ivl_t{ 1, (len_t)fasta_seq.seq.size() };
         ivls = ivl_t::invert(std::move(ivls), whole_ivl); // change to reportable-intervals.
+        ivls = sample_chunks(std::move(ivls));
+
+        if (ivls.empty()) {
+            continue;
+        }
 
         // GP-33472: preserve bounds info by emitting 1bp intervals at whole_ivl bounds
-        if (ivls.front().pos != 1) {
+        if (add_bounds && ivls.front().pos != 1) {
             ivls.insert(ivls.begin(), ivl_t{ 1, 1 });
         }
 
-        if (ivls.back().endpos() != whole_ivl.endpos()) {
+        if (add_bounds && ivls.back().endpos() != whole_ivl.endpos()) {
             ivls.push_back(ivl_t{ whole_ivl.endpos() - 1, 1 });
         }
 
@@ -526,6 +629,14 @@ static const bool test_parse_ivls = []
 }();
 
 
+// Work-around for GP-37387 - strip lcl|-prefix in both action-report and fasta
+// when looking up actions for a sequence, supporting the use-cases where the
+// prefixes are present in fasta-input or the action-report, but not both.
+static std::string strip_lcl_prefix(std::string seq_id)
+{
+    return std::move(seq_id).substr(str::startswith(seq_id, "lcl|") ? 4 : 0);
+}
+
 
 // GP-34579
 void gx::ApplyActionReport(
@@ -554,6 +665,7 @@ void gx::ApplyActionReport(
 
     enum class action_t { 
         mask,  // replace interval with Ns
+        lcase, // lowercase interval
         erase, // erase interval from the sequence
         split  // split the sequence in two around the interval
     };
@@ -593,7 +705,7 @@ void gx::ApplyActionReport(
                                                 // #accession      length  action  range   name
         VERIFY(row.size() == 8 || old_style); 
 
-        const auto seq_id     = seq_id_str_t{ row[0] };
+        const auto seq_id     = seq_id_str_t{ strip_lcl_prefix(row[0]) };
         const len_t seq_len   = tsv::to_num(row[old_style ? 1 : 3]);
         const auto& action    = row[old_style ? 2 : 4];
 
@@ -612,16 +724,18 @@ void gx::ApplyActionReport(
 
             VERIFY(action != "EXCLUDE"        || ((ivl.pos == 1) && (stop_pos == seq_len)));
             VERIFY(action != "ACTION_EXCLUDE" || ((ivl.pos == 1) && (stop_pos == seq_len)));
-            VERIFY(action != "TRIM"    || ((ivl.pos == 1) ^  (stop_pos == seq_len)));
-            VERIFY(action != "FIX"     || ((ivl.pos != 1) && (stop_pos != seq_len)));
+            VERIFY(action != "TRIM"           || ((ivl.pos == 1) ^  (stop_pos == seq_len)));
+            VERIFY(action != "FIX"            || ((ivl.pos != 1) && (stop_pos != seq_len)));
 
             if (   action == "ACTION_TRIM" || action == "SPLIT"                          // split
                 || action == "TRIM" || action == "EXCLUDE" || action == "ACTION_EXCLUDE" // erase (splice-out)
+                || action == "LOWERCASE"                                                 // lowercase
                 || action == "FIX")                                                      // mask
             {
                 actions[seq_id].push_back(action_ivl_t{ 
                         ivl, 
                         action == "FIX"          ? action_t::mask
+                      : action == "LOWERCASE"    ? action_t::lcase
                       : action == "ACTION_TRIM"  ? action_t::split
                       : action == "SPLIT"        ? action_t::split
                       :                            action_t::erase
@@ -643,14 +757,19 @@ void gx::ApplyActionReport(
     auto actions_count = 0ul;
     size_t num_erased_bases = 0;
     size_t num_hardmasked_bases = 0;
+    size_t num_lcased_bases = 0;
     for (auto fasta_seq : gx::MakeFastaReader(fasta_istr)) {
 
         //if (!seq_lens.count(fasta_seq.seq_id)) {
         //    GX_THROW("Seq-id " + fasta_seq.seq_id + " is not in the action-report.\n");
         //}
+        
+        // NB: we also strip lcl when loading the action-report.
+        const auto stripped_seq_id = seq_id_str_t{ strip_lcl_prefix(fasta_seq.seq_id) };
 
-        if (seq_lens.count(fasta_seq.seq_id) // It's fine if the sequence is missing from the action-report.
-            && seq_lens.at(fasta_seq.seq_id) != (len_t)fasta_seq.seq.length())
+
+        if (seq_lens.count(stripped_seq_id) // It's fine if the sequence is missing from the action-report.
+            && seq_lens.at(stripped_seq_id) != (len_t)fasta_seq.seq.length())
         {
             GX_THROW("Unexpected sequence length. seq-id: "   + fasta_seq.seq_id
                                      + "; in fasta: "         + std::to_string(fasta_seq.seq.length())
@@ -658,7 +777,7 @@ void gx::ApplyActionReport(
         }
 
         bool written_this_contam_seq = false;
-        const auto& seq_actions = at_or_default(actions, fasta_seq.seq_id);
+        const auto& seq_actions = at_or_default(actions, stripped_seq_id);
         const size_t num_splits = std::count_if(seq_actions.begin(), seq_actions.end(), L(_.action == action_t::split));
 
         for (const auto& action : seq_actions) {
@@ -690,7 +809,7 @@ void gx::ApplyActionReport(
                 fasta_seq_t chunk{};
                 chunk.seq     = iupacna_seq_t{ fasta_seq.seq.substr(action.ivl.endpos() - 1) };
 
-                chunk.defline = ">" + fasta_seq.seq_id 
+                chunk.defline = ">" + fasta_seq.seq_id // NB: original seq-id, could be with lcl|-prefix
                               + "~" + std::to_string(action.ivl.endpos())
                               + ".." + std::to_string(action.ivl.endpos() + chunk.seq.size() - 1);
 
@@ -700,6 +819,13 @@ void gx::ApplyActionReport(
                     write_fasta_seq(ostr, chunk);
                 } else {
                     // write to chunk to contam_fasta_out_ofstr?
+                }
+
+                num_erased_bases += action.ivl.len;
+
+            } else if (action.action == action_t::lcase) {
+                for (const auto i : irange{ action.ivl.pos - 1, action.ivl.endpos() - 1 }) {
+                    fasta_seq.seq[i] = (char)std::tolower((unsigned char)fasta_seq.seq[i]);
                 }
 
             } else {
@@ -732,6 +858,7 @@ void gx::ApplyActionReport(
     if (!silent) {
         std::cerr << "Applied " << actions_count << " actions; " 
                   << num_erased_bases << " bps dropped; " 
+                  << num_lcased_bases << " bps lowercased; " 
                   << num_hardmasked_bases << " bps hardmasked.\n";
     }
 }
@@ -790,7 +917,7 @@ ACGT
 /////////////////////////////////////////////////////////////////////////////
 void gx::GetFasta(const std::string& db_path, std::istream& istr, std::ostream& ostr)
 {
-    const auto sbj_infos  = seq_infos_t(ser::from_stream(open_ifstream(db_path)));
+    const auto sbj_infos  = seq_infos_t(ser::from_stream(*ser::open_istream(db_path)));
     const auto seq_id2oid = make_id2oid_map(sbj_infos);
 
     const std::string_view mmapped_seq_db = ser::mmap(str::replace_suffix(db_path, ".gxi", ".gxs"));

@@ -39,13 +39,11 @@ class CSmallIndex
 {
 public:
 
-#if 1
+#if 0
     using hmer20_t = hmer_t<uint32_t, 20>;
     static const int k_word_tlen = 29; // template: 0b11011011011011011011011011011
 #else
-    // GP-35566 - stalling this change pending publication
-    //
-    // NB: Insert extra 6 don't-care positions (two codons in two places),
+    // Insert extra 6 don't-care positions (two codons in two places),
     // making template length 29+6=35; to allow arbitrarily-spaced mismatches
     // (not just separated by a distance of multiple-of-3).
     static const int k_word_tlen = 35; 

@@ -64,6 +64,11 @@ static std::string resolve_path_to_gxi(const std::string& path)
     return result_path;
 }
 
+namespace GP_36950
+{
+    void run();
+}
+
 
 static int run(int argc, char* argv[])
 {
@@ -71,11 +76,18 @@ static int run(int argc, char* argv[])
 
     ser::prepare_standard_streams();
 
+    if (gx::get_env("GP_36950_GENOME1", std::string{}).size() > 0) {
+        GP_36950::run();
+        return 0;
+    }
+
+
     CLI::App app{"GX aligner and taxonomy classifier tool.\n\nhttps://github.com/ncbi/fcs/wiki/FCS-GX\n"};
 
     std::string seq_id2tax_id_path;
     std::string hardmask_locs_path;
     std::string softmask_locs_path;
+    std::string exons_locs_path;
     std::string action_report_path;
     std::string contam_fasta_out_path;
     std::string fasta_for_repeatdb_path;
@@ -154,6 +166,11 @@ static int run(int argc, char* argv[])
             ->description("Same format as --hardmask.\n"
                           "Exclude locations from indexing, but do not hardmask the sequence.\n");
 
+        cmd.add_option("--exons", exons_locs_path)
+            ->type_name("file")
+            ->description("Same format as --hardmask.\n"
+                          "Locations to index with denser sampling.\n");
+
         add_out_arg(cmd, "/path/to/db.gxi          - the db-index file (must have .gxi suffix).\n"
                          "/path/to/db.gxs          - additional output: sequences file.\n"
                          "/path/to/db.seq_info.tsv - additional output: sequences metadata.\n"
@@ -174,6 +191,14 @@ static int run(int argc, char* argv[])
         add_inp_arg(cmd, "fasta");
         add_out_arg(cmd, "Fasta with seq-ids transformed as $seq_id~$start..$stop (1-based, inclusive).");
     }
+    // ----------------------------------------------------------------------
+    {
+        auto& cmd = *app.add_subcommand("get-fasta-stats", "Generate fasta statistics");
+
+        add_inp_arg(cmd, "fasta");
+        add_out_arg(cmd, "JSON-object");
+    }
+
     // ----------------------------------------------------------------------
     {
         auto& cmd = *app.add_subcommand("align", "Align DNA-queries against a GX-database.");
@@ -230,8 +255,14 @@ static int run(int argc, char* argv[])
     } 
     // ----------------------------------------------------------------------
     {
-        auto& cmd = *app.add_subcommand("find-repeats", "Find transposon locations.");
+        auto& cmd = *app.add_subcommand("annotate-repeats", "Find transposon locations.");
         add_inp_arg(cmd, "fasta");
+        add_repeats_opt(cmd);
+        add_out_arg(cmd, "Tabular report of locations.");
+    }
+
+    {
+        auto& cmd = *app.add_subcommand("extract-consensus-repeats", "Extract consensus repeat sequences.");
         add_repeats_opt(cmd);
         add_out_arg(cmd, "Tabular report of locations.");
     }
@@ -266,24 +297,27 @@ static int run(int argc, char* argv[])
     VERIFY(!out_path.empty());
 
     std::istream& istr = inp_path == "stdin" ? std::cin :
-        [&]() -> std::ifstream&
+        [&]() -> std::istream&
         {
-            static auto ifstr = open_ifstream(inp_path);
-            return ifstr;
+            static auto istr_ = ser::open_istream(inp_path);
+            return *istr_;
         }();
 
+
     if (command == "make-db") {
-        auto seq_ids_ifstr      = open_ifstream(seq_id2tax_id_path);
-        auto taxa_ifstr_ptr     = open_ifstream_opt(taxa_path);
-        auto hardmask_ifstr_ptr = open_ifstream_opt(hardmask_locs_path);
-        auto softmask_ifstr_ptr = open_ifstream_opt(softmask_locs_path);
+        auto seq_ids_ifstr_ptr  = ser::open_istream(seq_id2tax_id_path);
+        auto taxa_ifstr_ptr     = ser::open_istream_opt(taxa_path);
+        auto hardmask_ifstr_ptr = ser::open_istream_opt(hardmask_locs_path);
+        auto softmask_ifstr_ptr = ser::open_istream_opt(softmask_locs_path);
+        auto exons_ifstr_ptr    = ser::open_istream_opt(exons_locs_path);
 
         VERIFY(out_path != "stdout");
         MakeDb(istr,
-               seq_ids_ifstr,
+               *seq_ids_ifstr_ptr,
                taxa_ifstr_ptr.get(),
                hardmask_ifstr_ptr.get(),
                softmask_ifstr_ptr.get(),
+               exons_ifstr_ptr.get(),
                out_path);
         return 0;
     }
@@ -298,16 +332,19 @@ static int run(int argc, char* argv[])
     db_path = resolve_path_to_gxi(db_path);
 
     if (command == "align") {
-        open_ifstream(db_path); // just to throw with good error message if not accessible
+        VERIFY(ser::open_istream(db_path)); // just to throw with good error message if not accessible
         ProcessQueries(db_path, taxa_path, fasta_for_repeatdb_path, istr, ostr);
 
     } else if (command == "get-fasta") {
-        open_ifstream(db_path); // just to throw with good error message if not accessible
+        VERIFY(ser::open_istream(db_path)); // just to throw with good error message if not accessible
         GetFasta(db_path, istr, ostr);
 
-    } else if (command == "find-repeats") {
-        auto fasta_istr1 = open_ifstream(fasta_for_repeatdb_path);
-        CTmasker(fasta_istr1).process_fasta(istr, ostr);
+    } else if (command == "annotate-repeats") {
+        auto fasta_istr1 = ser::open_istream(fasta_for_repeatdb_path);
+        CTmasker(fasta_istr1.get()).process_fasta(istr, ostr);
+
+    } else if (command == "extract-consensus-repeats") {
+        ExtractConsensusRepeats(fasta_for_repeatdb_path, ostr);
 
     } else if (command == "prot-minhash-create") {
         ostr << prot_minhash_id << "\t" << MakeProtsetMinhash(istr) << "\n";
@@ -316,20 +353,26 @@ static int run(int argc, char* argv[])
         PairwiseCompareMinHashes(istr, ostr);
 
     } else if (command == "taxify") {
-        auto taxa_ifstr = open_ifstream(str::replace_suffix(db_path, ".gxi", ".taxa.tsv"));
-        Taxify(istr, taxa_ifstr, hardmask_locs_path, asserted_div, db_path, out_path);
+        auto taxa_istr = ser::open_istream(str::replace_suffix(db_path, ".gxi", ".taxa.tsv"));
+        Taxify(istr, *taxa_istr, hardmask_locs_path, asserted_div, db_path, out_path);
 
     } else if (command == "clean-genome") {
-        auto action_report_ifstr = open_ifstream(action_report_path);
+        auto action_report_istr = ser::open_istream(action_report_path);
 
         auto contam_fasta_out_ofstr = 
             contam_fasta_out_path.empty() ? std::unique_ptr<std::ofstream>{}
                                           : std::make_unique<std::ofstream>(contam_fasta_out_path);
 
-        ApplyActionReport(istr, action_report_ifstr, ostr, contam_fasta_out_ofstr.get(), action_report_min_seq_len);
+        ApplyActionReport(istr, *action_report_istr, ostr, contam_fasta_out_ofstr.get(), action_report_min_seq_len);
+
+        // TODO: emit hash as auxiliary output here, or will run as 
+        // `gx clean-genome ... | tee >(gx get-fasta-summary --out=summary.json`)?
 
     } else if (command == "split-fasta") {
         SplitFasta(istr, ostr);
+
+    } else if (command == "get-fasta-stats") {
+        GetFastaStats(istr, ostr); 
 
     } else if (command == "show-license") {
         std::cout << GET_EMBEDDED_BLOB(______LICENSE);
@@ -343,6 +386,8 @@ static int run(int argc, char* argv[])
 }
 
 /////////////////////////////////////////////////////////////////////////////
+
+
 int main(int argc, char** argv)
 {
     static const bool enable_main_try_catch = gx::get_env("GX_ENABLE_MAIN_TRY_CATCH", 1);

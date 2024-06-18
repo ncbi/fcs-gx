@@ -32,19 +32,19 @@ using namespace gx;
 using fn::operators::operator%; // see fn.hpp
 using fn::operators::operator%=;
 
-// returns reference to static thread-local instance of CSmallIndex initialized from qry.
 CSmallIndex gx::MakeQueryIndex(const fasta_seq_t& qry, CSmallIndex index)
 {
     index.clear();
 
-    for (auto kmer = kmer_ci_t(qry.seq, CSmallIndex::k_word_tlen); kmer; ++kmer) {
-        const auto hmer = CSmallIndex::hmer20_t{ kmer.buf };
-        const auto ivl = as_ivl(kmer.i + qry.offset, CSmallIndex::k_word_tlen, hmer.is_flipped);
-        index.insert(hmer, ivl.pos);
-    }
+    process_kmers(qry.seq, CSmallIndex::k_word_tlen, [&](size_t i, kmer_bufs_t bufs)
+    {
+        const auto hmer = CSmallIndex::hmer20_t{ bufs.onebit };
+        const auto pos1 = as_pos1(qry.offset + i, CSmallIndex::k_word_tlen, hmer.is_flipped);
+        index.insert(hmer, pos1);
+    });
 
     if (!qry.seq.empty()) {
-        index.finalize(); // aovid expensive finalize() call if qry was empty
+        index.finalize(); // avoid expensive finalize() call if query was empty
     }
 
     return index;
@@ -268,9 +268,9 @@ segments_t gx::SeedRound2(
         const sbj_seq_t& sbj_seq;
         const ivl_t ivl;
 
-        na_t operator[](const size_t i) const
+        char operator[](const size_t i) const
         {
-            return sbj_seq.at1(pos1_t(ivl.pos + (int32_t)i));
+            return (char)sbj_seq.at1(pos1_t(ivl.pos + (int32_t)i));
         }
 
         size_t size() const
@@ -282,12 +282,14 @@ segments_t gx::SeedRound2(
     size_t num_pushed = 0;
 
     for (const auto& ivl : sbj_ivls) {
-        const auto seq_view = seq_view_t{ sbj_seq, ivl };
-        for (auto kmer = kmer_ci_t(seq_view, CSmallIndex::k_word_tlen); kmer; ++kmer) {
+        VERIFY(ivl.pos > 0);
 
-            const auto hmer    = CSmallIndex::hmer20_t{ kmer.buf };
+        const auto seq_view = seq_view_t{ sbj_seq, ivl };
+        process_kmers(seq_view, CSmallIndex::k_word_tlen, [&](size_t i, kmer_bufs_t bufs)
+        {
+            const auto hmer    = CSmallIndex::hmer20_t{ bufs.onebit };
             const auto hits    = index.at(hmer);
-            const auto sbj_pos = as_ivl(as_pos0(ivl.pos) + kmer.i, CSmallIndex::k_word_tlen, hmer.is_flipped).pos;
+            const auto sbj_pos = as_pos1(ivl.pos - 1 + i, CSmallIndex::k_word_tlen, hmer.is_flipped);
 
             if (hits.size() <= 10)
                 for (const auto& h : hits)
@@ -309,8 +311,7 @@ segments_t gx::SeedRound2(
 
             // TODO: else: search around diags in the lower-left and upper-right corners of the search-space.
             // (but we don't know what the search-space because we collapsed the intervals)
-
-        }
+        });
     }
 
     filter.finalize();

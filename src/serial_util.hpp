@@ -28,6 +28,9 @@
 #include <iterator>
 #include <type_traits>
 
+#include <cstdio>
+#include <streambuf>
+
 #ifdef __DEPRECATED
 #   undef __DEPRECATED
 #   include <strstream>  // for memistream
@@ -42,6 +45,8 @@ class ser
 {
 public:
     static std::string_view mmap(const std::string& path);
+
+    static size_t get_pagefault_count();
 
     // Access a random sample first and count page-faults.
     // If had page-faults, prefault all pages in file by accessing every page.
@@ -253,4 +258,115 @@ private:
 #endif
         }
     };
+
+    static inline std::string get_file_extension(const std::string& file_name)
+    {
+        const size_t dot_pos = file_name.find_last_of('.');
+        return dot_pos != std::string::npos && dot_pos != 0 ?
+               file_name.substr(dot_pos) : "";
+    }
+
+    /////////////////////////////////////////////////////////////////////////
+    // Used popen-wrapper, used in pipe_istream
+    template<size_t BufSize>
+    class pipe_streambuf : public std::streambuf
+    {
+    public:
+        pipe_streambuf(const pipe_streambuf&)            = delete;
+        pipe_streambuf(pipe_streambuf&&)                 = delete;
+        pipe_streambuf& operator=(const pipe_streambuf&) = delete;
+        pipe_streambuf& operator=(pipe_streambuf&&)      = delete;
+
+        pipe_streambuf(const std::string& command)
+            : m_cmd(command)
+        {
+            m_pipe = popen(command.c_str(), "r");
+            if (!m_pipe) {
+                GX_THROW("popen() failed: " + command);
+            }
+            setg(m_buffer, m_buffer, m_buffer);
+        }
+
+        // return 0 if already closed;
+        // else throw if can_throw and retcode returned by pclose is not 0;
+        // else return the retcode.
+        [[ nodiscard ]]
+        int close(bool can_throw = true)
+        {
+            const int ret = m_pipe ? pclose(m_pipe) : 0;
+            m_pipe = nullptr;
+
+            if (ret != 0 && can_throw) {
+                GX_THROW("\n\nError: pipe_istream command '" 
+                         + m_cmd
+                         + "' exited with code " + std::to_string(ret));
+            }
+            return ret;
+        }
+
+        // The user-code must call close() to make destructor non-throwing.
+        // Otherwise, if the pipe failed and was not closed, this will throw and terminate.
+        //
+        // NB: not double-throwing from stack-unwinding, since terminating will
+        // make the origin of uncaught exceptions inaccessible.
+        ~pipe_streambuf() override
+        {
+            bool can_throw = std::uncaught_exceptions() == 0;
+            (void)close(can_throw);
+        }
+
+    protected:
+        int underflow() override
+        {
+            if (gptr() < egptr()) {
+                return traits_type::to_int_type(*gptr());
+            }
+
+            VERIFY(eback() == m_buffer);
+            size_t len = fread(m_buffer, 1, sizeof(m_buffer), m_pipe);
+            setg(m_buffer, m_buffer, m_buffer + len);
+
+            return len == 0 ? traits_type::eof() : traits_type::to_int_type(*gptr());
+        }
+
+    private:
+        std::string m_cmd;        
+        char        m_buffer[BufSize]; // use std::vector for storage?
+        FILE*       m_pipe = nullptr;
+    };
+
+    /////////////////////////////////////////////////////////////////////////
+    // used to pipe a command's stdout as std::istream
+    class pipe_istream : public std::istream
+    {
+    public:
+        pipe_istream(const std::string& command)
+            : std::istream(&m_buf), m_buf(command)
+        {}
+
+        [[ nodiscard ]]
+        int close(bool can_throw = true)
+        {
+            return m_buf.close(can_throw);
+        }
+
+    private:
+        pipe_streambuf<1024> m_buf;
+    };
+
+public:
+    /////////////////////////////////////////////////////////////////////////
+    // Open file or a decompressor command, depending on file extension.
+    // 
+    // If the path has .mft extension, treat it as manifest-file of file-paths.
+    // If the path has .gz.mft, or .zstd.mft, etc. extension, treat it
+    // as manifest-file of compressed files.
+    //
+    // Returned unique_ptr is non-null.
+    static std::unique_ptr<std::istream> open_istream(std::string path);
+
+    static std::unique_ptr<std::istream> open_istream_opt(const std::string& path)
+    {
+        return path.empty() ? std::unique_ptr<std::istream>{} : open_istream(path);
+    }
 };

@@ -25,6 +25,7 @@
 
 #include "util.hpp"
 #include "seq_info.hpp"
+#include <ext/unordered_dense.h>
 
 namespace gx
 {
@@ -85,6 +86,9 @@ struct ivl_t
     }
 
     /////////////////////////////////////////////////////////////////////////
+
+    // Dilate interval in both directions if not empty; truncate to 0-boundary.
+    static ivl_t dilate(ivl_t ivl, len_t ext);
 
     // signed distance negative means overlap
     static int32_t sdist(const ivl_t& a, const ivl_t& b)
@@ -178,7 +182,8 @@ static inline ivl_t as_ivl(size_t stop_pos0, size_t len, bool is_flipped)
 }
 
 
-using locs_map_t = std::map<seq_id_str_t, ivls_t>;
+//using locs_map_t = std::map<seq_id_str_t, ivls_t>;  // perf-bottleneck in taxify
+using locs_map_t = ankerl::unordered_dense::map<seq_id_str_t, ivls_t, seq_id_str_hash_t>;
 auto LoadLocsMap(std::istream& istr_ptr) -> locs_map_t;
 
 /////////////////////////////////////////////////////////////////////

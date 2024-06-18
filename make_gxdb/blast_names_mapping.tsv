@@ -71,7 +71,6 @@ kinetoplastids	prst:euglenoids
 eukaryotes	prst:protists
 bony fishes	anml:fishes
 chimaeras	anml:fishes
-coelacanths	anml:fishes
 hagfishes	anml:fishes
 lampreys	anml:fishes
 lancelets	anml:fishes
@@ -83,6 +82,7 @@ forams	prst:forams
 AM fungi	fung:fungi
 blastocladiomycetes	fung:fungi
 blastocladiomycotan fungi	fung:fungi
+blastocladiomycete fungi	fung:fungi
 fungi	fung:fungi
 glomeromycetes	fung:fungi
 mucoromycotan fungi	fung:fungi
@@ -146,6 +146,7 @@ whip scorpions	anml:insects
 bats	anml:mammals
 carnivores	anml:mammals
 even-toed ungulates	anml:mammals
+even-toed ungulates & whales	anml:mammals
 insectivores	anml:mammals
 monotremes	anml:mammals
 odd-toed ungulates	anml:mammals
@@ -187,6 +188,7 @@ snakes	anml:reptiles
 lizards & snakes	anml:reptiles
 lizards	anml:reptiles
 turtles	anml:reptiles
+coelacanths	anml:reptiles
 rabbits & hares	anml:rodents
 rodents	anml:rodents
 micrognathozoans	anml:rotifers

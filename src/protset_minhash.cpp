@@ -60,21 +60,6 @@ std::string gx::MakeProtsetMinhash(std::istream& fasta_istr)
     constexpr auto mer_bitwidth = 30;
     constexpr auto minhash_size = 1024ul;
 
-    static const auto important_aas = []
-    {
-        auto tbl = std::vector<bool>(256, 0);
-        // https://pubmed.ncbi.nlm.nih.gov/8601843 PDEKGC
-        // Alternatively BLOSUM high-weight AAs on diagonal: CHPW,
-        // but seems to produce lower Jaccard concordances.
-        static const std::string s = "PDEK";
-
-        //std::cerr << "Anchor AAs: " << s << "\n";
-        for (const auto aa : s) {
-            tbl[aa] = true;
-        }
-        return tbl;
-    }();
-
 #if 1
     constexpr auto alphabet_bitwidth = 2;
     static const auto reduced_alphabet = make_reduced_alphabet("CFYW* MLIV GPATSN EDHQRK", 3);
@@ -86,10 +71,6 @@ std::string gx::MakeProtsetMinhash(std::istream& fasta_istr)
 
     // https://www.researchgate.net/publication/221596285_Bottom-k_sketches_Better_and_more_efficient_estimation_of_aggregates
     auto unique_mers_count = 0ul;
-
-    // if enabled, will only process words that have important_aas in the mid-position
-    // (improves sensitivity for large proteomes, but degrades for short proteomes (proks, organelles))
-    static const bool enable_aa_subsampling = get_env("GX_PROT_MINHASH_ENABLE_AA_SUBSAMPLING", false);
 
     auto bottom_sketch = std::priority_queue<uint64_t>{}; // capped at 100k
     {
@@ -105,13 +86,10 @@ std::string gx::MakeProtsetMinhash(std::istream& fasta_istr)
             for (const auto i : irange{ seq.seq.size() }) {
                 const auto aa = seq.seq[i];
 
-                buf = buf << alphabet_bitwidth | reduced_alphabet[aa];
+                buf = (buf << alphabet_bitwidth) | reduced_alphabet[aa];
                 const auto mer = buf & Ob1x(mer_bitwidth);
 
-                if (   i < min_i 
-                    || (enable_aa_subsampling && !important_aas[seq.seq[i - (min_i / 2)]])
-                    || seen_mers[mer])
-                {
+                if (i < min_i || seen_mers[mer]) {
                     continue;
                 }
 
@@ -119,7 +97,7 @@ std::string gx::MakeProtsetMinhash(std::istream& fasta_istr)
                 seen_mers[mer] = true;
                 bottom_sketch.push(uint64_hash(mer));
 
-                if (bottom_sketch.size() > minhash_size*100) {
+                if (bottom_sketch.size() > minhash_size * 100) {
                     bottom_sketch.pop();
                 }
             }

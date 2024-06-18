@@ -269,6 +269,17 @@ class ProcessPipeline:
 
             if p.p.returncode is not None and p.p.returncode not in p.ok_returncodes:
                 eprint(f"Error: Process failed with retcode {p.p.returncode}: {p.cmd})")
+
+                if abs(p.p.returncode) == 15 or abs(p.p.returncode) == 9:
+                    sig_str = "SIGKILL" if abs(p.p.returncode == 9) else "SIGTERM"
+
+                    eprint("\n",
+                        "\n     ********************************************************",
+                        "\n     *",
+                       f"\n     *  Note: the command was terminated by a signal {sig_str}"
+                        "\n     *",
+                        "\n     ********************************************************")
+
                 num_errors += 1
 
         return num_errors
@@ -339,20 +350,24 @@ def rate_limited(function, wait_time=0.5):
         filename = f"/tmp/{appname}.{function.__module__}.{function.__name__}.ratelimiter"
         printed  = False
 
-        while True:  # Wait for our turn
-            if not os.path.exists(filename) or time.time() - os.path.getmtime(filename) > wait_time:
-                with open(filename, 'a', encoding="ascii"):  # Touch the file
-                    os.utime(filename, None)
-
-                os.chmod(filename, 0o666)  # Make everyone-writeable
-                return function(*args, **kwargs)
-
+        # Wait for our turn
+        while os.path.exists(filename) and time.time() - os.path.getmtime(filename) < wait_time:
             if not printed:
                 printed = True
                 debug_print("API rate-limiting in effect - waiting to touch", filename, "...")
 
             time.sleep(random.uniform(0, wait_time / 2))
 
+        try:
+            # Touch the file to signal other process that we're about execute the function
+            with open(filename, 'a', encoding="ascii"):
+                os.utime(filename, None)
+
+            os.chmod(filename, 0o666)  # Make everyone-writeable (can fail if not the owner).
+        except:
+            pass
+
+        return function(*args, **kwargs)
 
     return wrapper
 
@@ -514,13 +529,8 @@ def check_preconditions(args) -> None:
 
 # ---------------------------------------------------------------------------
 # Set fasta, tax_id, out_basename, div args, if not specified.
-# Also set out_taxonomy_rpt and gzip_c args.
 # Verify that files are accessible.
 def fill_missing_args(args) -> None:
-
-    # minigzip is a faster (not quite drop-in) replacement for gzip - use it if available.
-    # NB: minigzip -dc /path/to/file does not work - must cat | minigzip ... instead
-    args.gzip_c = "minigzip -c" if shutil.which("minigzip") else "gzip -c"
 
     # GP-33682
     if not args.fasta and args.gc_genomes_root_dir and args.gc_acc:
@@ -625,15 +635,15 @@ def fill_missing_args(args) -> None:
 #    /path/to/gx taxify --db=/path/to/gxdb/all.gxi -o $out_basename.taxonomy.rpt.tmp
 def run_gx_pipeline(args) -> None:
     def add_zcat_fasta(p):
-        p.add(["cat", args.fasta])
-        p.add(["minigzip", "-d"] if shutil.which("minigzip") else ["gzip", "-cdf"])
+        gzip = "minigzip" if shutil.which("minigzip") else "gzip"
+        p.add([gzip, "-c", "-d", "-f", args.fasta] if args.fasta.endswith(".gz") else ["cat", args.fasta])
 
         if args.fasta.endswith(".mft"):
             p.add(["grep", "-Ev", "^(#|$)"])
             p.add(["xargs", "-n1", "cat"])
-            p.add(["minigzip", "-d"] if shutil.which("minigzip") else ["gzip", "-cdf"])
+            p.add([gzip, "-c", "-d", "-f"])
 
-    def run(p_zcat_fasta, p_save_hits, p_main):
+    def run(p_zcat_fasta, p_get_fasta_stats, p_save_hits, p_main):
         Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
         # Download fasta, as appropraite
@@ -649,6 +659,15 @@ def run_gx_pipeline(args) -> None:
 
         add_zcat_fasta(p_main)
 
+        # GP-37176
+        # ... | tee >(gx get-fasta-stats > {args.out_basename}.fasta-stats.json) | ...
+        p_get_fasta_stats.add(
+            [gx_bin, "get-fasta-stats"],
+            stdin=subprocess.PIPE,
+            out_filename=f"{args.out_basename}.fasta-stats.json"
+        )
+        p_main.add(["tee", f"/dev/fd/{p_get_fasta_stats.stdin_fd}"])
+
         if args.split_fasta:
             p_main.add([gx_bin, "split-fasta"])
 
@@ -656,7 +675,7 @@ def run_gx_pipeline(args) -> None:
             # For .mft files size is unknown, so will use --size=0 for simplified bar and no ETA
             factor = (3.2 if args.fasta.endswith(".gz") else 0 if args.fasta.endswith(".mft") else 1)
             est_bytes = int(os.path.getsize(args.fasta) * factor)
-            p_main.add(["pv", "-Wbratpe", "--interval=0.5", f"--size={est_bytes}"])
+            p_main.add(["pv", "-Wbratpe", "--interval=0.5", f"--size={est_bytes}", "--buffer-size=104857600"])
 
         # For large genomes (not prok/virus/synthetic) will mask transposon repeats (unless explicitly specified).
         with_repeats = (
@@ -680,11 +699,23 @@ def run_gx_pipeline(args) -> None:
 
         # As-if tee >(gzip -c >{args.out_basename}.hits.tsv.gz)
         if args.save_hits:
-            p_save_hits.add(args.gzip_c, stdin=subprocess.PIPE, out_filename=f"{args.out_basename}.hits.tsv.gz")
+            p_save_hits.add(
+                ["minigzip" if shutil.which("minigzip") else "gzip", "-c"],
+                stdin=subprocess.PIPE,
+                out_filename=f"{args.out_basename}.hits.tsv.gz",
+            )
             p_main.add(["tee", f"/dev/fd/{p_save_hits.stdin_fd}"])
 
         if not args.allow_same_species:
             p_main.add(["awk", "-v", "FS=\t", f"(NR>2 && NF != 8){{ exit 111; }} ($3 != {args.tax_id})"])
+
+        
+        # Add a buffer between `align` and `taxify`, so that `align` can keep producing output
+        # without blocking while `taxify` is busy processing intervals for a subject-id and is
+        # not actively reading stdin.
+        #
+        if shutil.which("pv"):
+           p_main.add(["pv", "--quiet", "--buffer-size=104857600"])
 
         p_main.add([
             gx_bin,
@@ -697,8 +728,9 @@ def run_gx_pipeline(args) -> None:
     # NB: nested-with instead of multi-with to support python3.8
     with ProcessPipeline() as p_zcat_fasta:
         with ProcessPipeline() as p_save_hits:
-            with ProcessPipeline() as p_main:
-                run(p_zcat_fasta, p_save_hits, p_main)
+            with ProcessPipeline() as p_get_fasta_stats:
+                with ProcessPipeline() as p_main:
+                    run(p_zcat_fasta, p_get_fasta_stats, p_save_hits, p_main)
 
 
 # ---------------------------------------------------------------------------
@@ -713,11 +745,13 @@ def run_classify_taxonomy_and_action_report(args) -> None:
         with_this_py([
             f"{args.bin_dir}/classify_taxonomy",
             f"--in={args.out_taxonomy_rpt}.tmp",
+            f"--fasta-stats={args.out_basename}.fasta-stats.json",
             *([f"--species={args.species}"] if args.species else []),
         ]),
         args.out_taxonomy_rpt,
     )
     os.remove(f"{args.out_taxonomy_rpt}.tmp")
+    os.remove(f"{args.out_basename}.fasta-stats.json")
 
     if args.action_report:
         run(
@@ -729,6 +763,17 @@ def run_classify_taxonomy_and_action_report(args) -> None:
             ]),
             f"{args.out_basename}.fcs_gx_report.txt",
         )
+
+        # Experimental/stub, related to GP-37176
+        if False:
+            subprocess.run(
+                f"{args.bin_dir}/gx clean-genome --input={args.fasta} --action-report={args.out_basename}.fcs_gx_report.txt | {args.bin_dir}/gx get-fasta-stats --output={args.out_basename}.cleaned-fasta-stats.json",
+                check=True, shell=True
+            )
+
+            
+            subprocess.run(f"echo Cleaned Fasta Stats; cat {args.out_basename}.cleaned-fasta-stats.json", check=True, shell=True)
+            os.remove(f"{args.out_basename}.cleaned-fasta-stats.json")
 
 
 # ---------------------------------------------------------------------------
@@ -905,8 +950,8 @@ def parse_args():
 
     # -----------------------------------------------------------------------
     # copy-pasted from action_report.py (as a flag, rather than bool param)
-    action_report_group.add_argument("--ignore-same-kingdom", action="store_true")
     if is_ncbi:
+        action_report_group.add_argument("--ignore-same-kingdom", action="store_true")
         action_report_group.add_argument("--production-build-name")
 
     # -----------------------------------------------------------------------
@@ -976,6 +1021,7 @@ def parse_args():
         args.gc_acc = None
         args.gc_genomes_root_dir = None
         args.production_build_name = None
+        args.ignore_same_kingdom = None
 
     elif not args.gc_genomes_root_dir and args.fasta and args.fasta.startswith("ftp://"):
         eprint(
@@ -1029,6 +1075,14 @@ def main() -> None:
 
     check_preconditions(args)
     fill_missing_args(args)
+
+    if args.debug:
+        try:
+            debug_print("\nCPU count: ", os.cpu_count())
+            debug_print("\n/proc/meminfo:\n" + ''.join(os.popen('cat /proc/meminfo').readlines()))
+            debug_print("\ntop:\n" + ''.join(os.popen('top -b | head -n6').readlines()))
+        except:
+            pass
 
     start_time = time.time()
     try:

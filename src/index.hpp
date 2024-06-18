@@ -49,7 +49,7 @@ public:
             static const auto s_enable_hmer_grouping = get_env("GX_ENABLE_HMER_GROUPING", false);
 
             if (s_enable_hmer_grouping)
-                while (true)
+                while (true) // maybe this should be just 1 iteration?
             {
                 auto best = std::make_pair(w, uint64_hash(w));
 
@@ -77,6 +77,11 @@ public:
               | ((w & 0b11111111111111111111111000000000000000) >> 15); //(38-(15+8))
             //                         ^^^^^^^^ // subkey will be constructed from these positions
         }
+
+        uint64_t hash() const
+        {
+            return uint64_hash(w);
+        }
     };
 
     static constexpr int k_word_tlen = 38 / 2 * 3 - 1; // template: 0b11011011011011011011011011011011011011011011011011011011
@@ -84,9 +89,6 @@ public:
                                     // ^^^^^^     - number of codons
                                     // ^^^^^^^^^^ - number of bases
                                     //            ^^^ exclude last codon's third position to make the template symmetric (reverse-complementable)
-
-    static const uint8_t k_stride = 11;
-    static_assert(k_stride % 3 != 0, ""); // so that we sample coding words in all three phases
 
     struct node_t
     {
@@ -117,8 +119,10 @@ public:
 public:
     ///////////////////////////////////////////////////////////////////
 
-    CIndex()
+    CIndex(size_t pseudorandom_stride = 8)
+      : m_pseudorandom_stride(pseudorandom_stride)
     {
+        VERIFY(m_pseudorandom_stride >= 1);
         const auto scope_guard = make_exception_scope_guard([&]
         {
             std::cerr << "NB: Not enough RAM for creating gx-db. Require 24GiB + 1 byte/bp.\n";
@@ -142,9 +146,13 @@ public:
     // the pos1 is expected to be negative iff hmer is flipped
     void insert(const hmer38_t hmer, seq_oid_t seq_oid, pos1_t pos);
 
-    void finalize(const seq_infos_t&);
+    void finalize(const seq_infos_t&, const tax_map_t&);
+
+    void check_nodes(size_t) const;
 
     nodes_view_t at(hmer38_t) const;
+
+    size_t get_pseudorandom_stride() const { return m_pseudorandom_stride; }
     /////////////////////////////////////////////////////////////////////////
 
 private:
@@ -168,6 +176,7 @@ private:
     const uint32_t* m_subcounts32 = nullptr;
     const node_t*   m_nodes_ptr   = nullptr;
     bool            m_finalized   = false;
+    size_t          m_pseudorandom_stride = 1;
 
     uint64_t x_subcount(size_t i) const
     {

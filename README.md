@@ -27,18 +27,18 @@ This file outlines how to run FCS-GX from the source code.
     ```./scripts/sync_files.py get --mft=https://ftp.ncbi.nlm.nih.gov/genomes/TOOLS/FCS/database/test-only/test-only.manifest  --dir=/dev/shm/gxdb```
 
 - Retrieve this test fasta file.  
-    ```curl -LO https://github.com/ncbi/fcs/raw/main/examples/fcsgx_test.fa.gz```  
+    ```curl -LO https://zenodo.org/records/10932013/files/FCS_combo_test.fa```  
 
 - Make a directory for output files.  
     ```mkdir gx_out```
 
 - Run GX.  
-    ```./dist/run_gx --fasta=fcsgx_test.fa.gz --tax-id=6973 --gx-db=/dev/shm/gxdb/test-only --out-dir=./gx_out/```  
+    ```./dist/run_gx --fasta=FCS_combo_test.fa --tax-id=4932 --gx-db=/dev/shm/gxdb/test-only --out-dir=./gx_out/```  
 
 - A successful run should produce these two files inside of gx_out directory:
     ```
-    fcsgx_test.fa.6973.fcs_gx_report.txt
-    fcsgx_test.fa.6973.taxonomy.rpt
+    FCS_combo_test.4932.fcs_gx_report.txt
+    FCS_combo_test.4932.taxonomy.rpt
     ```
 
 ### For normal runs, use the complete *all* database:
@@ -60,7 +60,7 @@ This file outlines how to run FCS-GX from the source code.
    ```
 
 - Run GX.  
-``` ./dist/run_gx --fasta fcsgx_test.fa.gz --tax-id 6973 --gx-db /dev/shm/gxdb/all --out-dir ./gx_out/```  
+``` ./dist/run_gx --fasta FCS_combo_test.fa --tax-id 4932 --gx-db /dev/shm/gxdb/all --out-dir ./gx_out/```  
 
 
 ### Environment Variables 
@@ -93,16 +93,41 @@ To get the fasta for a specific set of coordinates, format your input file with 
 ##[["GX locs",1,1]]
 NC_060925.1     1       200
 ```
-### Output files
-Please see the [GitHub documentation](https://github.com/ncbi/fcs/wiki/FCS-GX) for more details on the output files.
+### FCS-GX wiki
+Please see the [FCS-GX wiki](https://github.com/ncbi/fcs/wiki/FCS-GX-quickstart) for more details on input requirements, outputs, and troubleshooting.
 
 ## Releases
 
 Please see [release history](https://github.com/ncbi/fcs/releases) 
 
 ## Citing FCS-GX
+Astashyn A, Tvedte ES, Sweeney D, Sapojnikov V, Bouk N, Joukov V, Mozes E, Strope PK, Sylla PM, Wagner L, Bidwell SL, Brown LC, Clark K, Davis EW, Smith-White B, Hlavina W, Pruitt KD, Schneider VA, Murphy TD. Rapid and sensitive detection of genome contamination at scale with FCS-GX. Genome Biol. 2024 Feb 26;25(1):60. doi: 10.1186/s13059-024-03198-7. PMID: 38409096; PMCID: PMC10898089.
 
-Astashyn A, Tvedte ES, Sweeney D, Sapojnikov V, Bouk N, Joukov V, Mozes E, Strope PK, Sylla PM, Wagner L, Bidwell SL, Clark K, Davis EW, Smith-White B, Hlavina W, Pruitt KD, Schneider VA, Murphy TD. [Rapid and sensitive detection of genome contamination at scale with FCS-GX](https://www.biorxiv.org/content/10.1101/2023.06.02.543519v1). biorXiv. (2023).
+[Read the FCS-GX paper](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-024-03198-7)
+
+## Licensing
+The NCBI FCS tool suite software authored by NCBI is a "United States
+Government Work" under the terms of the United States Copyright
+Act. It was written as part of the authors' official duties as United
+States Government employees and thus cannot be copyrighted. This
+software is freely available to the public for use. The National
+Library of Medicine and the U.S. Government have not placed any
+restriction on its use or reproduction.
+
+Although all reasonable efforts have been taken to ensure the accuracy
+and reliability of the software and data, the NLM and the
+U.S. Government do not and cannot warrant the performance or results
+that may be obtained by using this software or data. The NLM and the
+U.S. Government disclaim all warranties, express or implied, including
+warranties of performance, merchantability or fitness for any
+particular purpose.
+
+Please cite NCBI in any work or product based on this material.
+
+## Funding
+This work was supported by the National Center for Biotechnology Information of the National Library of Medicine (NLM), National Institutes of Health.
+
+FCS is part of the [NIH Comparative Genomics Resource (CGR)](https://www.ncbi.nlm.nih.gov/comparative-genomics-resource/), an NLM project to establish an ecosystem to facilitate reliable comparative genomics analyses for all eukaryotic organisms.
 
 ## Contact
 

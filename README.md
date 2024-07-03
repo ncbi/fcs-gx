@@ -3,7 +3,7 @@ This file outlines how to run FCS-GX from the source code.
 
 ### Building requirements
 
-- GCC >= 7.3
+- GCC >= 12.2.0
 - cmake >= 3.1
 - python >= 3.8
 

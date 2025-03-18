@@ -131,6 +131,11 @@ struct str
             && 0 == s.compare(0, prefix.length(), prefix);
     }
 
+    static inline bool startswith(const char* s, const char* prefix)
+    {
+        return s && prefix && std::strncmp(s, prefix, std::strlen(prefix)) == 0;
+    }
+
     static inline bool endswith(const std::string& s, const std::string& suffix)
     {
         return s.length() >= suffix.length()

@@ -131,17 +131,104 @@ void gx::DropShadowedOnSbj(segments_t& segs)
 
 /////////////////////////////////////////////////////////////////////////////
 
-void gx::DropSingletons(
-               segments_t& segs,
-                     len_t word_len,
-                     len_t diag_dist_thr,
-                     len_t dist_thr)
+
+// max diag-distance and antidiag-distance, respectively.
+// If both distances between segments are within thresholds, consider them neighboring.
+static const std::pair<int, int>& s_get_singleton_filtering_thresholds()
+{
+    static const auto ret = std::make_pair(
+        gx::get_env("GX_SINGLETON_FILTER_WINDOW_DIAG",     5000),
+        gx::get_env("GX_SINGLETON_FILTER_WINDOW_ANTIDIAG", 50000)
+    );
+    return ret;
+}
+
+
+static bool s_are_neighbors(const segment_t& l, const segment_t& r)
+{
+    const auto& thr = s_get_singleton_filtering_thresholds();
+
+    // sorted by q in CSingletonFilter::push(); sorted by s in drop_singletons
+    // VERIFY(l.q <= r.q);
+
+    return l.s_oid == r.s_oid
+        && abs(l.diag() - r.diag()) <= thr.first
+        && l.antidiag() + (l.len * 2) + thr.second >= r.antidiag()
+        && l.q != r.q;
+    // Note: lengths double in diagonalized representation, hence len*2
+}
+
+
+void gx::CSingletonFilter::push(segment_t seg)
+{
+    VERIFY(!seg.flags);
+
+    seg.make_q_fwd(); // or s_fwd; just need to be consistent.
+
+    const auto& thr = s_get_singleton_filtering_thresholds();
+
+    // prev-seg is the seg in the hotlist that is within diag_window on diag.
+    // To get the "fat-diag" we divide by diag_window and round up or down.
+    const auto get_prev_seg = [&, this](segment_t seg_, bool round_down) -> segment_t&
+    {
+        const auto k = round_down ? 0 : (thr.first / 2);
+        const auto fat_diag = (seg_.diag() + k) / thr.first;
+        const auto i = uint64_hash(
+                (uint64_t(fat_diag) << 32)
+              | (uint64_t(seg_.s_oid))
+        ) % m_segs.size();
+        return m_segs[i];
+    };
+
+    segment_t& prev = get_prev_seg(seg, true);
+
+    if (segment_t::are_coalescible(prev, seg) && prev.q_end() + 10 >= seg.q) {
+        prev.len = seg.q_end() - prev.q;
+        prev.flags = 1;
+        return;
+    } else if (s_are_neighbors(prev, seg)) {
+        prev.flags = 1;
+        seg.flags = 1;
+    } else if (segment_t& other_prev = get_prev_seg(seg, false); s_are_neighbors(other_prev, seg)) {
+        other_prev.flags = 1;
+        seg.flags = 1;
+    }
+
+    // Accept the `prev` into dest if it's marked as having a neighbor (flag == 1)
+    // or it's "recent" (close on q), and so has not had a chance to be matched 
+    // with a neighbor yet. Some of these will be false positives, but they'll be
+    // further dropped later in drop_neighbors().
+    VERIFY(prev.q <= seg.q);
+    if (   prev.flags == 1 
+        || prev.q + thr.second/2 >= seg.q)
+    {
+        prev.flags = 0;
+        m_dest_segs_ptr->push_back(prev);
+    }
+    prev = seg;
+}
+
+
+void gx::CSingletonFilter::finalize()
+{
+    for (auto& seg : m_segs)
+        if (seg.flags == 1)
+    {
+        seg.flags = 0;
+        m_dest_segs_ptr->push_back(seg);
+    }
+
+    this->reset(m_dest_segs_ptr, m_segs.size());
+}
+
+
+void gx::CSingletonFilter::drop_singletons(segments_t& segs, len_t word_len)
 {
     for (auto& seg : segs) {
         VERIFY(seg.valid());
         seg.flags = 0;
         seg.make_q_fwd(); // this spreads hits on both strands on subject,
-                          // so neighbrs, are closer together.
+                          // so neighbrs are closer together in the in segs
     }
 
     if (!std::is_sorted(segs.begin(), segs.end(), by_sbj)) {
@@ -152,13 +239,10 @@ void gx::DropSingletons(
         for (size_t l = r - 1; l + 16 > r && l < segs.size(); l--) {
             VERIFY(segs[l] != segs[r]);
 
-            if (abs(segs[l].diag() - segs[r].diag()) <= diag_dist_thr
-                && segs[l].s_end() + dist_thr >= segs[r].s
-                && segs[l].s_oid == segs[r].s_oid)
-            {
+            if (s_are_neighbors(segs[l], segs[r])) {
                 segs[l].flags = 1;
                 segs[r].flags = 1;
-                break;
+                break; // or not to break
             }
         }
     }

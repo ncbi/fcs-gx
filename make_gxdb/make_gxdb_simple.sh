@@ -48,12 +48,12 @@ done
 # ---------------------------------------------------------------------------
 # GP-37029
 echo "Preparing exons map."
-cat $inp | cut -f6 |
-    sed 's/genomic.fna.gz/genomic.gff.gz/' | xargs cat | gzip -d |
-    grep -Pv '^#' | grep -P '\tCDS\t' |
-    cut -f 1,4,5 |  # seq-id, start, stop
-    sort -u |
-    sed '1i##[["GX locs",1,1]]' | # prepend header
+cat $inp |
+    cut -f6                                      |  # assembly-path
+    grep -Pv 'from_genomic'                      |  # skip cds_from_genomic and rna_from_genomic
+    sed 's/genomic.fna.gz/genomic.gff.gz/'       |
+    xargs -I{} make_gxdb/get_gff_exon_locs.sh {} |
+    sed '1i##[["GX locs",1,1]]'                  |  # prepend header
     gzip -c > $out_dir/exons.locs.gz
 
 

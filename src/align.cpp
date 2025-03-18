@@ -241,7 +241,26 @@ static auto s_print_cvg_by_seeds = make_scope_guard([](bool)
 });
 #endif
 
-static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& index, const CTmasker& tmasker)
+using tax_ids_t = std::vector<gx::tax_id_t>;
+
+static const std::vector<gx::tax_id_t>& s_get_preferred_taxa()
+{
+    static const auto ret = 
+        gx::get_env("GX_PREFERRED_TAXA", std::string{})
+      % tsv::split_on_delim(',')
+      % fn::where L(_ != "")
+      % fn::transform L(gx::tax_id_t{ tsv::to_num(_) })
+      % fn::unique_all()
+      % fn::to(tax_ids_t());
+   return ret;
+}
+
+
+static prelim_align_ret_t prelim_align(
+    const fasta_seq_t& qry,
+    const CIndex& index, 
+    const CTmasker& tmasker,
+    const seq_infos_t& sbj_infos)
 {
     const size_t qry_len = qry.seq.size();
 
@@ -335,7 +354,6 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
     static const bool enable_augment_singletons  = get_env("GX_ENABLE_AUGMENT_SINGLETONS", false);
     static const bool enable_singleton_filtering = get_env("GX_ENABLE_SINGLETON_FILTERING", true);
 
-
     // Count of hits per subject seq-id-hash; used in enable-augment-singletons stage
     // std::unordered_map affects performance, so using just plain vector and disregarding collisions.
     static thread_local std::vector<uint32_t> h_oid2count{};
@@ -359,18 +377,26 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
         // geometric mean of count of hits per position, excluding repeat-specific (size() == 0 after above)
         const double gmean_occ = gmean_by(hitses, L(_.size()));
 
+        static const double max_occ_thr_factor = get_env("GX_ALIGN_SEED_MAX_OCC_THR_FACTOR", 4.0);
+
         // to further filter hits that slip by repeat-filtering
-        const auto max_occ_thr = (size_t)std::max(20.0, gmean_occ * 4);
+        const auto max_occ_thr = (size_t)std::max(20.0, gmean_occ * max_occ_thr_factor);
 
         for (size_t i = 0; i < qry_len; ++i) {
             const auto q_pos = as_ivl(i, CIndex::k_word_tlen, is_flippeds[i]).pos;
             const nodes_view_t hits = hitses[i];
 
             for (const auto& h : hits)
-                if (h.pos != k_frequent_hmer_marker && hits.size() < max_occ_thr)
             {
                 auto seg = segment_t{ q_pos, h.pos, h.seq_oid, CIndex::k_word_tlen };
                 seg.make_s_fwd();
+
+                // skip hits that are over-represented, unless they are consensus-repeats
+                if ((h.pos == k_frequent_hmer_marker || hits.size() > max_occ_thr)
+                    && !sbj_infos.at(seg.s_oid).is_consensus_repeat_model())
+                {
+                    continue;
+                }
 
                 if (enable_augment_singletons) {
                     ++h_oid2count[uint64_hash(+seg.s_oid) % h_oid2count.size()];
@@ -407,7 +433,7 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
     // can't do it 100% due to segs being expunged from the hotlist prematurely.
     Coalesce(segs);
    
-#if 0 
+#if 0
     // debugging
     {
         auto ivls = ivls_t{};
@@ -420,14 +446,16 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
     }
 #endif
 
-    DropShadowedOnSbj(segs);
+    if (static const bool s_drop_shadowed_on_sbj = get_env("GX_ALIGN_DROP_SHADOWED_ON_SBJ", true); s_drop_shadowed_on_sbj) {
+        DropShadowedOnSbj(segs);
+    }
 
     // Another round of singleton dropping singleton for the same reason
     // as Coalesce above. We do DropShadowedOnSbj first so if there's a
     // stack of repeats on subject between neighbors, we remove it so that
     // there's better chance of neighborship being detected.
     if (enable_singleton_filtering && segs.size() > 10) {
-        DropSingletons(segs, CIndex::k_word_tlen);
+        CSingletonFilter::drop_singletons(segs, CIndex::k_word_tlen);
     }
 
     // Do another pass over the initial hits.
@@ -437,18 +465,33 @@ static prelim_align_ret_t prelim_align(const fasta_seq_t& qry, const CIndex& ind
     // euglenoids hits for JAMJQZ010001831.1; also significantly improves
     // coverage by insects for cockroach, and coverage by other fungal divs
     // for GCA_001574975.1 (monoblepharidomycetes).
-    if (enable_augment_singletons && !segs.empty()) {
-        const auto min_count = fn::first_or_default(fn::cfrom(h_oid2count) % fn::take_top_n(20));
+    const auto& s_preferred_taxa = s_get_preferred_taxa();
+    if (!segs.empty() && (enable_augment_singletons || !s_preferred_taxa.empty())) {
+
+        // will augment hits from subject seq-ids that are in top-10 most frequent by counts of hits.
+        const auto min_count = fn::first_or_default(fn::cfrom(h_oid2count) % fn::take_top_n(10) % fn::sort());
 
         for (size_t i = 0; i < qry_len; ++i) {
             const auto q_pos = as_ivl(i, CIndex::k_word_tlen, is_flippeds[i]).pos;
-            for (const auto& h : hitses[i])
-                if (h_oid2count[uint64_hash(+h.seq_oid) % h_oid2count.size()] > min_count)
+
+            for (const auto& h : hitses[i]) {
+
                 // NB: >, not >=, as there may be arbitrarily many
-            {
-                segs.push_back(segment_t{ q_pos, h.pos, h.seq_oid, CIndex::k_word_tlen });
+                const bool is_preferred_sbj_seq = 
+                    enable_augment_singletons
+                    && h_oid2count[uint64_hash(+h.seq_oid) % h_oid2count.size()] > min_count;
+
+                const bool is_preferred_taxon = std::find(
+                    s_preferred_taxa.begin(), 
+                    s_preferred_taxa.end(), 
+                    sbj_infos.at(h.seq_oid).tax_id
+                ) != s_preferred_taxa.end();
+
+                if (is_preferred_sbj_seq || is_preferred_taxon) {
+                    segs.push_back(segment_t{ q_pos, h.pos, h.seq_oid, CIndex::k_word_tlen });
+                }
             }
-        }
+        }   
 
         Coalesce(segs);
     }
@@ -586,6 +629,40 @@ static std::string format_output(
 
 /////////////////////////////////////////////////////////////////////////////
 
+static void filter_to_best_chains(segments_t& segs, const seq_infos_t& sbj_infos)
+{
+    VERIFY(std::is_sorted(segs.begin(), segs.end(), by_sbj));
+    VERIFY(std::all_of(segs.begin(), segs.end(), L(_.flags == 0)));
+
+    // Apply segs-chaining over segs that are not from consensus-repeats subjects.
+    const auto it = std::stable_partition(
+            segs.begin(), segs.end(),
+            L(sbj_infos.at(_.s_oid).is_consensus_repeat_model()));
+
+    const auto segs_v = fn::from(it, segs.end());
+
+    // Filter to best-chains. NB this invalidates the sort order.
+    for_each_group_by( segs_v,
+                       L(sbj_infos.at(_.s_oid).tax_id), // group by taxon
+                       L(FilterToBestChain(_, 1000ul/*max-backtrack*/)));
+
+    // FilterToBestChain sets .flags = 1; for the consensus-repeats segs we'll set it manually
+    // so they are preserved in the filtering step below.
+    for (auto& seg : fn::from(segs.begin(), it)) {
+        seg.flags = 1;
+    }
+
+    // keep segs marked as belonging to best-chain
+    segs %= fn::where L(_.flags != 0);
+
+    // reset the flags
+    for (auto& s : segs) {
+        s.flags = 0;
+        VERIFY(s.q > 0);
+    }
+}
+
+
 static void align_round2(
         const tax_map_t&                    taxa,
         const seq_infos_t&                  sbj_infos,
@@ -614,7 +691,12 @@ static void align_round2(
     }
 #endif
 
-    const auto round2_taxa = SelectTaxaForRound2(segs1, sbj_infos, taxa);
+    const auto round2_taxa = 
+        SelectTaxaForRound2(segs1, sbj_infos, taxa)
+      % fn::append(s_get_preferred_taxa())
+      % fn::sort()
+      % fn::unique_adjacent()
+      % fn::to_vector();
 
     VERIFY(std::is_sorted(round2_taxa.begin(), round2_taxa.end()));
 
@@ -652,7 +734,7 @@ static void align_round2(
 
         static thread_local segments_t tmp_segs{};
         tmp_segs.clear();
-        tmp_segs = SeedRound2(query_index, inp_chunk, sbj_seq, sbj_oid, sv, std::move(tmp_segs));
+        tmp_segs = SeedRound2(query_index, inp_chunk, sbj_seq, sbj_oid, sbj_inf, sv, std::move(tmp_segs));
         segs2 <<= std::as_const(tmp_segs);
     });
 
@@ -694,7 +776,7 @@ static auto align_chunk( const tax_map_t& taxa,
 
     const auto elapsed = timer{};
 
-    auto prelim_align_result = prelim_align(inp_chunk, index, tmasker);
+    auto prelim_align_result = prelim_align(inp_chunk, index, tmasker, sbj_infos);
     auto& segs = prelim_align_result.segs;
 
     // adjust query position from query-chunk coordinates into query-coordinates
@@ -722,7 +804,7 @@ static auto align_chunk( const tax_map_t& taxa,
         }
     }
 
-    auto extend_and_filter = [&](bool gapped_extend)
+    const auto extend_and_filter = [&](bool gapped_extend)
     {
         // orient on query and sort by subject, as required by UngappedSegsInPlace
         for (auto& seg : segs) {
@@ -744,18 +826,7 @@ static auto align_chunk( const tax_map_t& taxa,
             segs %= fn::unstable_sort_by(get_sbj); // restore order including auxiliary segs from GappedExtend
         }
 
-        VERIFY(std::is_sorted(segs.begin(), segs.end(), by_sbj));
-
-        // Filter to best-chains. NB this invalidates the sort order
-        for_each_group_by( segs,
-                           L(sbj_infos.at(_.s_oid).tax_id), // group by taxon
-                           L(FilterToBestChain(_, 1000ul/*max-backtrack*/)));
-        segs %= fn::where L(_.flags != 0); // keep segs marked as belonging to best-chain
-
-        for (auto& s : segs) {
-            s.flags = 0;
-            VERIFY(s.q > 0);
-        }
+        filter_to_best_chains(segs, sbj_infos);
     };
 
     extend_and_filter(false); // extend-and-filter to get better signal for round-2 taxa selection
@@ -819,7 +890,7 @@ void gx::ProcessQueries(  const std::string& db_path,
     const std::string_view mmapped_db = ser::mmap(db_path);
 
     static const auto prefetch_mode = get_env("GX_PREFETCH", 1U); // 0=no; 1=autodetect; 2=yes
-    if(prefetch_mode) {
+    if (prefetch_mode) {
         const bool force = prefetch_mode == 2;
         ser::prefetch_mmapped_pages(gxs_file_path, mmapped_seq_db, force);
         ser::prefetch_mmapped_pages(db_path,       mmapped_db,     force);

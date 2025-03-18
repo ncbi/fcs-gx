@@ -230,6 +230,8 @@ public:
     uint64_t m_genome_len = 0;
     uint64_t m_aggregate_cvg_len = 0;
 
+    taxdiv_oid_t m_top_div_track__div_oid = taxdiv_oid_t{};
+
     div_stats_t(const tax_map_t& tax_map)
     {
         m_stats.resize(256);
@@ -255,6 +257,18 @@ public:
 
         const auto& top_div_track = // based on cvg_len accumulated so far
             *std::max_element(tracks.begin(), tracks.end(), BY(m_stats[+_.div_oid].cvg_len));
+
+        // GP-39017
+        // top-div guess has changed - reset the intersection-with-top-div,
+        // since otherwise in the cases of egregious-contamination it may
+        // the final stats appear as-if distant asserted and contaminant divs are highly overlapping
+        // and lump them into primary-divs set.
+        if (m_top_div_track__div_oid != top_div_track.div_oid) {
+            m_top_div_track__div_oid = top_div_track.div_oid;
+            for (auto& stat : m_stats) {
+                stat.top_div_isect_len_nr = 0;        
+            }
+        }
 
         const auto top_div_track_nr = ivl_t::subtract(top_div_track.ivls, all_repeats);
 

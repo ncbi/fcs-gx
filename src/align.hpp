@@ -62,6 +62,7 @@ segments_t SeedRound2( const CSmallIndex& index,
                        const fasta_seq_t& qry,
                          const sbj_seq_t& sbj_seq,
                           const seq_oid_t sbj_oid,
+                        const seq_info_t& sbj_info,
                        const segs_view_t& segs1,
                                segments_t ret = {});
 }

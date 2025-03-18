@@ -15,6 +15,7 @@
 #include <fstream>
 #include <string>
 #include <dirent.h>
+#include <sqlite3.h>
 
 #if not defined(GIT_REVISION)
 #    define GIT_REVISION "unknown"
@@ -69,12 +70,31 @@ namespace GP_36950
     void run();
 }
 
+// sqlite version-mismatch is possible if fac-switch configures environment
+// to find a libsqlite3.so lib version at linktime,
+// whereas cmake's find_package finds a different version in 
+// /usr/include/sqlite3.h at cmake-time.
+//
+// This is handled by overriding -DCMAKE_PREFIX_PATH=$(SQLITE_PREFIX_DIR) 
+// in Makefile when running cmake, but we need this runtime check to verify things are working.
+static void verify_sqlite_version()
+{
+    const auto sqlite_header_version  = std::string{ SQLITE_VERSION };
+    const auto sqlite_lib_version     = std::string{ sqlite3_libversion() };
+    if (sqlite_header_version != sqlite_lib_version) {
+        std::cerr << "Fatal: sqlite version mismatch: header: " << sqlite_header_version 
+                  << "; lib: " << sqlite_lib_version << " - aborting.\n";
+        std::abort();
+    }
+}
+
 
 static int run(int argc, char* argv[])
 {
     using namespace gx;
 
     ser::prepare_standard_streams();
+    verify_sqlite_version();
 
     if (gx::get_env("GP_36950_GENOME1", std::string{}).size() > 0) {
         GP_36950::run();
@@ -93,7 +113,7 @@ static int run(int argc, char* argv[])
     std::string fasta_for_repeatdb_path;
     std::string taxa_path;
     std::string prot_minhash_id;
-    std::string db_path   = "db/all.gxi";
+    std::string db_path   = "./db/";
     std::string inp_path  = "stdin";
     std::string out_path  = "stdout";
     std::string asserted_div = "unknown";
@@ -286,8 +306,15 @@ static int run(int argc, char* argv[])
         app.add_subcommand("show-license", "Show licensing information.");
     }
 
+
     app.require_subcommand(1);
-    app.footer("\nbuild:" __DATE__ " " __TIME__ "; git:" + std::string{g_git_revision} + "\n");
+    app.footer(
+            "\nbuild:" __DATE__ " " __TIME__
+            "; git:"    + std::string{ g_git_revision }
+          + "; sqlite:" + SQLITE_VERSION
+          + "\n"
+    );
+
     CLI11_PARSE(app, argc, argv);
     errno = 0; // clean-up after parse, just in case
 
@@ -329,7 +356,9 @@ static int run(int argc, char* argv[])
             return ofstr;
         }();
 
-    db_path = resolve_path_to_gxi(db_path);
+    if (command == "get-fasta" || command == "align" || command == "taxify") {
+        db_path = resolve_path_to_gxi(db_path);
+    }
 
     if (command == "align") {
         VERIFY(ser::open_istream(db_path)); // just to throw with good error message if not accessible

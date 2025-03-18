@@ -96,21 +96,26 @@ std::vector<tax_id_t> gx::SelectTaxaForRound2(
     }}
 #endif
 
+    static const size_t num_round2_taxa = get_env("GX_NUM_ROUND2_TAXA", 3);
+
     auto mark_candidates_by = [&](auto key_fn)
     {
         taxa %= fn::unstable_sort_by(fn::by::decreasing(key_fn)); // best ones at front
-        size_t n = 0; // count of marked so far.
+        size_t n = 1; // count of marked taxa
 
-        // Will mark up-to 3. The 3rd-best must be from a different tax-group.
+        // Will mark up to num_round2_taxa; NB: last one must be from a different tax-group.
         // because arbitrarily many top-taxa may be from close cross-species,
         // and for contamination-assessment purposes we also need next-best tax-group.
         for (auto& t : taxa) {
-            if (n == 3) {
+            if (n > num_round2_taxa) {
                 break;
-            } else if (  n == 0
-                     ||  n == 1
-                     || (n == 2 && tax_map.at(t.tax_id).taxdiv_oid
-                                != tax_map.at(taxa.front().tax_id).taxdiv_oid))
+            } else if (
+                    n <  num_round2_taxa
+                ||  (   // n == num_round2_taxa
+                        tax_map.at(t.tax_id           ).taxdiv_oid 
+                     != tax_map.at(taxa.front().tax_id).taxdiv_oid
+                    )
+                )
             {
                 t.is_candidate = true;
                 n++;
@@ -150,14 +155,24 @@ segments_t gx::SeedRound2(
         const fasta_seq_t& qry,
           const sbj_seq_t& sbj_seq,
            const seq_oid_t sbj_oid,
+         const seq_info_t& sbj_info,
         const segs_view_t& segs1,
                 segments_t segs)
 {
     segs.clear();
 
-    static const auto nbr_size_abs_cap = get_env("GX_ROUND2_NBR_SIZE_ABS_CAP", 100000);
-    static const auto nbr_size_rel_cap = get_env("GX_ROUND2_NBR_SIZE_REL_CAP", 2.0);
-    const auto neighborhood_size = std::min(nbr_size_abs_cap, len_t(nbr_size_rel_cap * (double)qry.seq.size()));
+    static const auto nbr_size_abs_cap_large = get_env("GX_ROUND2_NBR_SIZE_ABS_CAP_LARGE", 100000);
+    static const auto nbr_size_abs_cap_small = get_env("GX_ROUND2_NBR_SIZE_ABS_CAP_SMALL",   5000);
+    static const auto nbr_size_rel_cap       = get_env("GX_ROUND2_NBR_SIZE_REL_CAP",          2.0);
+ 
+    const bool is_sbj_exome_or_repeat =
+        sbj_info.is_consensus_repeat_model()
+     || str::startswith(sbj_info.get_seq_id(), "lcl|exome");
+
+    const auto neighborhood_size = std::min(
+        is_sbj_exome_or_repeat ? nbr_size_abs_cap_small : nbr_size_abs_cap_large,
+        len_t(nbr_size_rel_cap * (double)qry.seq.size())
+    );
     // neighborhood_size is the extent of the search neighborhood on subject sequneces around
     // preliminary segs. Some genomes are very fragmented and are composed of large number
     // of short sequences, so we can't spend search 100kb around every short query -

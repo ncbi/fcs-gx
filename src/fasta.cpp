@@ -56,7 +56,9 @@ static const std::array<bool, 256> s_is_valid_iupacna = []
     return ret;
 }();
 
-
+#if 0
+// NB: now handled by `sed` step in run_gx.py, GP-38159
+//
 // GP-35596: Replace '~' with '{TILDE}', except for "our" suffixes, e.g.
 // my_id~123..456
 // my_id~~123..456
@@ -129,6 +131,7 @@ static bool test_escape_foreign_tildes = []
     VERIFY(escape_foreign_tildes("my-~~id~123..456~~123..456").second == "my-{TILDE}{TILDE}id~123..456~~123..456");
     return true;
 }();
+#endif
 
 
 /////////////////////////////////////////////////////////////////////////////
@@ -196,7 +199,7 @@ static seq_id_str_t extract_seq_id(std::string defline)
         break;
     }
 
-    seq_id = escape_foreign_tildes(std::move(seq_id)).second;
+    // seq_id = escape_foreign_tildes(std::move(seq_id)).second;
 
     VERIFY(!seq_id.empty());
     return seq_id_str_t{ std::move(seq_id) };
@@ -582,7 +585,7 @@ static void write_fasta_seq(std::ostream& ostr, const gx::fasta_seq_t& fasta_seq
     } else if (   std::toupper((int)fasta_seq.seq.front()) == 'N'
                || std::toupper((int)fasta_seq.seq.back())  == 'N')
     {
-        std::cerr << "Warning: Unexpected Ns at the beginning or end of the sequence: " 
+        std::cerr << "Warning: Ns at the beginning or end of the sequence: " 
                   << fasta_seq.defline << std::endl;
     }
 
@@ -681,6 +684,43 @@ void gx::ApplyActionReport(
     auto seq_lens  = std::map<seq_id_str_t, len_t>{};
     size_t row_num = 0;
 
+
+    auto validate_action = [](
+            const std::string&  action, 
+            const seq_id_str_t& seq_id,
+            const len_t         seq_len,
+            const ivl_t&        ivl)
+    {
+        static const bool relax_action_report_checks = get_env("GX_RELAXED_ACTION_REPORT_CHECKS", true);
+        const auto stop_pos = ivl.endpos() - 1;
+
+        try {
+            VERIFY(stop_pos <= seq_len);
+            VERIFY(action != "EXCLUDE"        || ((ivl.pos == 1) && (stop_pos == seq_len)));
+            VERIFY(action != "ACTION_EXCLUDE" || ((ivl.pos == 1) && (stop_pos == seq_len)));
+            VERIFY(action != "MITOCHONDRION"  || ((ivl.pos == 1) && (stop_pos == seq_len)));
+            VERIFY(action != "PLASTID"        || ((ivl.pos == 1) && (stop_pos == seq_len)));
+            VERIFY(action != "TRIM"           || ((ivl.pos == 1) ^  (stop_pos == seq_len))); 
+
+        } catch (std::exception& e) {
+            std::cerr << "Invalid action " << action << " on seq-id " << seq_id << "@" << ivl.to_string() << "\n";
+            throw;
+        }
+
+        // GP-38714
+        if (action == "FIX" && !((ivl.pos != 1) && (stop_pos != seq_len))) {
+            for (static bool printed_once = false; !printed_once; printed_once = true) {
+                std::cerr << (relax_action_report_checks ? "Warning: " : "Error: ")
+                          << "Invalid action " << action 
+                          << " at seq-id " << seq_id << "@" << ivl.pos << ".." << ivl.endpos() - 1
+                          << " - the coordinates should not abut the start or end (expecting action TRIM for this)."
+                          << " Set GX_RELAXED_ACTION_REPORT_ACTIONS=0|1 env-var to treat this as error|warning.\n\n";
+            }
+            VERIFY(relax_action_report_checks);
+        }
+    };
+
+
     for (const tsv::row_t& row : tsv::from(action_report_istr)) {
         ++row_num;
 
@@ -719,18 +759,12 @@ void gx::ApplyActionReport(
         }
 
         for (const auto& ivl : ivls) {
-            const auto stop_pos = ivl.endpos() - 1;
-            VERIFY(stop_pos <= seq_len);
+            validate_action(action, seq_id, seq_len, ivl);
 
-            VERIFY(action != "EXCLUDE"        || ((ivl.pos == 1) && (stop_pos == seq_len)));
-            VERIFY(action != "ACTION_EXCLUDE" || ((ivl.pos == 1) && (stop_pos == seq_len)));
-            VERIFY(action != "TRIM"           || ((ivl.pos == 1) ^  (stop_pos == seq_len)));
-            VERIFY(action != "FIX"            || ((ivl.pos != 1) && (stop_pos != seq_len)));
-
-            if (   action == "ACTION_TRIM" || action == "SPLIT"                          // split
-                || action == "TRIM" || action == "EXCLUDE" || action == "ACTION_EXCLUDE" // erase (splice-out)
-                || action == "LOWERCASE"                                                 // lowercase
-                || action == "FIX")                                                      // mask
+            if (   action == "ACTION_TRIM" || action == "SPLIT"                                                                              // split
+                || action == "TRIM" || action == "EXCLUDE" || action == "ACTION_EXCLUDE" || action == "MITOCHONDRION" || action == "PLASTID" // erase (splice-out)
+                || action == "LOWERCASE"                                                                                                     // lowercase
+                || action == "FIX")                                                                                                          // mask
             {
                 actions[seq_id].push_back(action_ivl_t{ 
                         ivl, 
@@ -754,10 +788,12 @@ void gx::ApplyActionReport(
     }
 
     // Apply actions to the input fasta.
-    auto actions_count = 0ul;
-    size_t num_erased_bases = 0;
-    size_t num_hardmasked_bases = 0;
-    size_t num_lcased_bases = 0;
+    auto actions_count        = 0ul;
+    auto num_erased_bases     = 0ul;
+    auto num_hardmasked_bases = 0ul;
+    auto num_lcased_bases     = 0ul;
+    auto num_dropped_seqs     = 0ul;
+
     for (auto fasta_seq : gx::MakeFastaReader(fasta_istr)) {
 
         //if (!seq_lens.count(fasta_seq.seq_id)) {
@@ -853,10 +889,13 @@ void gx::ApplyActionReport(
             write_fasta_seq(*contam_fasta_out_ofstr, fasta_seq);
             written_this_contam_seq = true;
         }
+
+        num_dropped_seqs += fasta_seq.seq.size() < min_seq_len;
     }
 
     if (!silent) {
         std::cerr << "Applied " << actions_count << " actions; " 
+                  << num_dropped_seqs << " seqs dropped; "
                   << num_erased_bases << " bps dropped; " 
                   << num_lcased_bases << " bps lowercased; " 
                   << num_hardmasked_bases << " bps hardmasked.\n";
@@ -877,6 +916,8 @@ AA
 ACGT
 >seq5
 ACGTNNNNNTGCANNACGT
+>seq6
+ACGTACGT
 )"};
 
     auto actions_istr = std::stringstream{"##[[\"FCS genome report\", 2, 1]]" + str::replace(R"(
@@ -886,6 +927,7 @@ seq2|1|16|16|EXCLUDE|.|.|drop seq2
 seq3|1|2|2|INFO|.|.|drop - too short (will test with min_seq_len=3)
 seq4|1|4|4|INFO|.|.|preserve
 seq5|19|ACTION_TRIM|5..9,14..15|split - GP-36138
+seq6|1|8|8|MITOCHONDRION|.|.|drop - mito - GP-39485
 )", "|", "\t")};
 
     auto expected_out = std::string{R"(

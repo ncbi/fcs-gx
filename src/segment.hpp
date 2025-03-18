@@ -374,15 +374,7 @@ static inline const auto by_sbj = fn::by::make_comp(get_sbj);
 void Coalesce(segments_t& segs, len_t gap_thr = 100); // TODO: coalesce less aggressively?
 void DropShadowedOnSbj(segments_t& segs);
 
-void DropSingletons(
-               segments_t& segs,
-                     len_t word_len,
-                     len_t diag_dist = 5000,
-                     len_t antidiag_dist = 50000);
-
-
 void FilterToHotWindows(segments_t& segs, len_t diag_w = 100000, len_t antidiag_w = 2000000);
-
 
 void FilterOutRepeatsOnSbj(segments_t& segs, const seq_infos_t& sbj_infos, uint32_t num_elems = 100, len_t span_thr = 1000);
 
@@ -419,77 +411,14 @@ public:
     void reset(segments_t* dest, size_t size)
     {
         m_dest_segs_ptr = dest;
-
         m_segs.clear();
         m_segs.resize(size);
     }
 
-    void push(segment_t seg)
-    {
-        VERIFY(!seg.flags);
+    void push(segment_t seg);
+    void finalize();
 
-        seg.make_q_fwd(); // or s_fwd; just need to be consistent.
-
-        // if seeds are witihn these distances, treat them as neighbors.
-        // (These are the same as default parms in DropSingletons
-        static const int k_diag_window = 5000;
-        static const int k_antidiag_window = 50000;
-
-        const auto are_neighbors = [&](const segment_t& l, const segment_t& r)
-        {
-            VERIFY(l.q <= r.q);
-
-            return l.s_oid == r.s_oid
-                && abs(l.diag() - r.diag()) <= k_diag_window
-                && l.antidiag() + (l.len*2) + k_antidiag_window >= r.antidiag()
-                && l.q != r.q;
-            // Note: lengths double in diagonalized representation.
-        };
-
-        // prev-seg is the seg in the hotlist that is within k_diag_window on diag.
-        // To get the "fat-diag" we divide by k_diag_window and round up or down.
-        const auto get_prev_seg = [this](segment_t seg_, bool round_down) -> segment_t&
-        {
-            const auto k = round_down ? 0 : (k_diag_window/2);
-            const auto fat_diag = (seg_.diag() + k) / k_diag_window;
-            const auto i = uint64_hash((uint64_t(fat_diag) << 32)
-                                       | (uint64_t(seg_.s_oid))) % m_segs.size();
-            return m_segs[i];
-        };
-
-        segment_t& prev = get_prev_seg(seg, true);
-
-        if (segment_t::are_coalescible(prev, seg) && prev.q_end() + 10 >= seg.q) {
-            prev.len = seg.q_end() - prev.q;
-            prev.flags = 1;
-            return;
-        } else if (are_neighbors(prev, seg)) {
-            prev.flags = 1;
-            seg.flags = 1;
-        } else if (segment_t& other_prev = get_prev_seg(seg, false); are_neighbors(other_prev, seg)) {
-            other_prev.flags = 1;
-            seg.flags = 1;
-        }
-
-        VERIFY(prev.q <= seg.q);
-        if (prev.flags == 1 || prev.q + k_antidiag_window/2 >= seg.q) {
-            prev.flags = 0;
-            m_dest_segs_ptr->push_back(prev);
-        }
-        prev = seg;
-    }
-
-    void finalize()
-    {
-        for (auto& seg : m_segs)
-            if (seg.flags == 1)
-        {
-            seg.flags = 0;
-            m_dest_segs_ptr->push_back(seg);
-        }
-
-        this->reset(m_dest_segs_ptr, m_segs.size());
-    }
+    static void drop_singletons(segments_t& segs, len_t word_len);
 
 private:
     segments_t* m_dest_segs_ptr;

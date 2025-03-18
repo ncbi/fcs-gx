@@ -28,6 +28,8 @@
 #include "segment.hpp"
 #include "serial_util.hpp"
 #include "ext/json5.hpp"
+#include "ext/sqlite3vial.hpp"
+
 
 // for rusage
 #include <unistd.h>

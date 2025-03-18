@@ -22,8 +22,10 @@
 
 -----------------------------------------------------------------------------
 """
-# pylint: disable=C0301,C0302,C0114,C0103,C0116,C0115,R0913,R0914,R0915,R0916,R0911,W0702,W0603,R1732
+# pylint: disable=C0301,C0302,C0114,C0103,C0116,C0115,R0913,R0914,R0915,R0916,R0911,W0702,W0603,R1732,W0125
 # fmt: off
+# Noncompliant@Checkmarx.os_access_violation:suppress
+# Noncompliant@Checkmarx.path_traversal:suppress
 
 import sys
 assert sys.version_info.major >= 3 and sys.version_info.minor >= 8, f"Python version: {sys.version_info}. Require python 3.8 or newer."
@@ -44,10 +46,10 @@ import uuid
 import random
 import functools
 
+from dataclasses import dataclass
 from contextlib  import suppress
-from typing      import Tuple
+from typing      import Tuple, Any
 from collections import defaultdict
-from collections import namedtuple
 from pathlib     import Path
 
 # Execute gx-pipeline:
@@ -58,6 +60,7 @@ from pathlib     import Path
 #   --split-fasta=T
 #   --out-dir=.
 
+
 # ---------------------------------------------------------------------------
 def get_gx_build_str(args, just_semver=False) -> str:
     """ 
@@ -66,6 +69,7 @@ def get_gx_build_str(args, just_semver=False) -> str:
         E.g. "Oct 26 2023 13:47:25; git:v0.4.0-210-g35dc81ce"
         If just_semver=True, then just the semver part, e.g. "0.4.0-210-g35dc81ce"
     """
+    # Noncompliant@Checkmarx.command_injection:false_positive
     gx_help = subprocess.run(
         [f"{args.bin_dir}/gx", "--help"],
         check=True, shell=False, capture_output=True, encoding="ascii"
@@ -76,19 +80,17 @@ def get_gx_build_str(args, just_semver=False) -> str:
 
 
 # ---------------------------------------------------------------------------
+def get_gxdb_build_date(gx_db) -> str:
+    assert gx_db.endswith(".gxi"), gx_db
+    return json.load(open(os.path.splitext(gx_db)[0] + ".meta.jsonl", encoding="UTF-8"))["build-date"]
+
+
+# ---------------------------------------------------------------------------
 def send_analytics(args, start_time, is_success=True):
     """ Report analytics to NCBI. GP-36549 """
 
     if not args.phone_home_label:
         return
-
-    gxdb_dir = os.path.dirname(args.gx_db) if args.gx_db.endswith(".gxi") else args.gx_db
-
-    gxdb_build_date = next(iter(set((
-        json.load(open(f"{d}/{f}", encoding="UTF-8"))["build-date"]
-        for d in [gxdb_dir] for f in os.listdir(gxdb_dir)
-        if f.endswith(".meta.jsonl") and os.path.exists(d + "/" + f.replace(".meta.jsonl", ".gxi"))
-    ))), "NA")
 
     # NB: Same params as in fcs.py, and additional ncbi_label
     url_args = {
@@ -96,7 +98,7 @@ def send_analytics(args, start_time, is_success=True):
         "ncbi_mode"             : "screen",  # ... as above.
         "ncbi_op"               : "genome",  # ... as above.
         "sgversion"             : get_gx_build_str(args, just_semver=True),
-        "ncbi_gxdb"             : gxdb_build_date,
+        "ncbi_gxdb"             : get_gxdb_build_date(args.gx_db),
         "ncbi_architecture"     : platform.platform(),
         "ncbi_python_version"   : sys.version.split()[0],
         "ncbi_container_engine" : "NA",
@@ -112,6 +114,7 @@ def send_analytics(args, start_time, is_success=True):
         eprint("Not sending analytics in debug-mode:", url)
     else:
         with suppress(Exception):  # e.g. no internet access
+            # Noncompliant@Checkmarx.ssrf:false_positive
             urllib.request.urlopen(url)
 
 
@@ -149,6 +152,7 @@ def debug_print(*args):
         eprint("#######", *args)
 
 
+# ---------------------------------------------------------------------------
 def with_this_py(args):
     # args[0] may be a bazel executable (without .py), or a python script (with .py)
     # If the latter, execute it with same python3 binary as this script,
@@ -165,6 +169,7 @@ def with_this_py(args):
 
 
 # ---------------------------------------------------------------------------
+
 class ProcessPipeline:
     """
     Emulate shell pipelines and process-substitutions in pure python and anonymous pipes.
@@ -202,11 +207,12 @@ class ProcessPipeline:
         p0.add("wc", out_filename="wc.txt")
     """
 
-    # p              : process' handle returned by subprocess.Popen.
-    # cmd            : command used to start the process.
-    # ok_returncodes : tuple of allowed ret-code values.
-    # fds            : tuple of fds to close on exit.
-    Process = namedtuple("Process", "p cmd ok_returncodes fds")  # pylint: disable=C0103
+    @dataclass
+    class Process:
+        p               : Any           # hadle returned by subprocess.Popen
+        cmd             : list[str]     # command used to start the process
+        ok_returncodes  : tuple[int]    # tuple of non-error returncodes (typically (0,))
+        fds             : list[int]     # managed file-descriptors
 
     def __init__(self):
         self.processes = []
@@ -256,33 +262,59 @@ class ProcessPipeline:
     # -----------------------------------------------------------------------
     @staticmethod
     def cleanup(processes) -> int:  # Return number of processes exited with error
-        num_errors = 0
+        if isinstance(processes, list):
+            return sum(ProcessPipeline.cleanup(p) for p in processes)
 
-        for p in processes:
-            debug_print("Cleaning up process", p.cmd)
+        p = processes
+        debug_print("Ending process: ", p.cmd)
+
+        # GP-39936 - avoid 'OSError: [Errno 9] Bad file descriptor'
+        # after an anonymous pipe was closed with os.fclose(fd) below.
+        # NB: python-3.13 and above
+        try:
+            p.p.stdin.close()
+        except:
+            pass
+
+        try:
+            p.p.stdout.flush()
+            p.p.stdout.close()
+        except:
+            pass
+
+        if p.p.poll() is None:
+            debug_print(f"Terminating process: {p.cmd})")
             p.p.terminate()
+            time.sleep(0.5)
 
-            # closing fd signals to the process on the other end
-            # of anonymous pipe that the pipe is closed, unblocking it.
-            for fd in p.fds:
+        if p.p.poll() is None:
+            p.p.kill()
+
+        # closing fd signals to the process on the other end
+        # of anonymous pipe that the pipe is closed, unblocking it.
+        for fd in p.fds:
+            try:
                 os.close(fd)
+            except:
+                pass
 
-            if p.p.returncode is not None and p.p.returncode not in p.ok_returncodes:
-                eprint(f"Error: Process failed with retcode {p.p.returncode}: {p.cmd})")
+        if p.p.returncode is None or p.p.returncode in p.ok_returncodes:
+            return 0
 
-                if abs(p.p.returncode) == 15 or abs(p.p.returncode) == 9:
-                    sig_str = "SIGKILL" if abs(p.p.returncode == 9) else "SIGTERM"
+        if p.p.returncode != -signal.SIGPIPE:
+            eprint(f"Error: Process failed with retcode {p.p.returncode}: {p.cmd})")
 
-                    eprint("\n",
-                        "\n     ********************************************************",
-                        "\n     *",
-                       f"\n     *  Note: the command was terminated by a signal {sig_str}"
-                        "\n     *",
-                        "\n     ********************************************************")
+        if abs(p.p.returncode) in (9, 15):
+            sig_str = "SIGKILL" if abs(p.p.returncode == 9) else "SIGTERM"
 
-                num_errors += 1
+            eprint("\n",
+                "\n     ********************************************************",
+                "\n     *",
+               f"\n     *  Note: the command was terminated by a signal {sig_str}"
+                "\n     *",
+                "\n     ********************************************************")
 
-        return num_errors
+        return 1
 
     # -----------------------------------------------------------------------
     # NB: with processes connected by named pipes there's a following issue to
@@ -499,6 +531,21 @@ def get_blast_div(args) -> str:
     line = grep(args.gx_db.replace(".gxi", ".blast_div.tsv.gz"), f"^{args.tax_id}\t")
     div = line.split("\t")[1].rstrip() if line else None
 
+    # Fallback on taxpropdump - GP-38809
+    def get_div_from_taxpropdump():
+        taxpropdump_path = os.getenv("NCBI", ".") + "/bin/taxpropdump"
+        if not shutil.which(taxpropdump_path):
+            return None
+
+        debug_print("Getting div from taxpropdump.")
+        row = subprocess.run(
+            [taxpropdump_path, "-taxids", str(args.tax_id), "blast"],
+            check=True, shell=False, capture_output=True, encoding="ascii"
+        ).stdout.strip().replace('"', "").split("\t")
+
+        return row[2] if len(row) == 3 and row[0] == str(args.tax_id) else None
+
+
     # Fallback on eutils:
     def get_div_from_taxonomy():
         debug_print("Getting div from Taxonomy.")
@@ -509,7 +556,7 @@ def get_blast_div(args) -> str:
             eprint(f"\nError: Could not look-up tax-id {args.tax_id} from NCBI Taxonomy.\n\n")
             raise
 
-    return div or get_div_from_taxonomy()
+    return div or get_div_from_taxpropdump() or get_div_from_taxonomy()
 
 
 # -----------------------------------------------------------------------
@@ -524,7 +571,7 @@ def check_preconditions(args) -> None:
 
     for file in ["gx", "classify_taxonomy", "action_report", "blast_names_mapping.tsv"]:
         ok = any((Path(f"{args.bin_dir}/{file}{sfx}").is_file() for sfx in ("", ".py")))
-        assert ok, f"File {args.bin_dir}/{file} is not accessible. Might need to specify --bin-dir explicitly."
+        assert ok, f"File {args.bin_dir}/{file} is not accessible."
 
 
 # ---------------------------------------------------------------------------
@@ -608,12 +655,12 @@ def fill_missing_args(args) -> None:
     # -----------------------------------------------------------------------
     # Construct out_basename, if not provided, and prefix out_dir.
     assert args.fasta != "/dev/stdin" or args.out_basename, "--out-basename must be specified."
-    args.out_basename = args.out_basename or gc_basename or re.sub(r"\.\w+$", f".{args.tax_id}", Path(args.fasta).name)
+    args.out_basename = args.out_basename or gc_basename or (Path(args.fasta).stem + f".{args.tax_id}")
     args.out_basename = f"{args.out_dir}/{args.out_basename}"
 
     args.out_taxonomy_rpt = f"{args.out_basename}.taxonomy.rpt"
     eprint("bin-dir   :", args.bin_dir)
-    eprint("gx-db     :", args.gx_db)
+    eprint("gx-db     :", args.gx_db, "build-date:", get_gxdb_build_date(args.gx_db))
     eprint("gx-ver    :", get_gx_build_str(args))
     eprint("output    :", args.out_taxonomy_rpt)
 
@@ -634,6 +681,7 @@ def fill_missing_args(args) -> None:
 #    awk -v FS='\t' -v tax_id=$tax_id '($3 != tax_id)' |
 #    /path/to/gx taxify --db=/path/to/gxdb/all.gxi -o $out_basename.taxonomy.rpt.tmp
 def run_gx_pipeline(args) -> None:
+
     def add_zcat_fasta(p):
         gzip = "minigzip" if shutil.which("minigzip") else "gzip"
         p.add([gzip, "-c", "-d", "-f", args.fasta] if args.fasta.endswith(".gz") else ["cat", args.fasta])
@@ -643,7 +691,9 @@ def run_gx_pipeline(args) -> None:
             p.add(["xargs", "-n1", "cat"])
             p.add([gzip, "-c", "-d", "-f"])
 
-    def run(p_zcat_fasta, p_get_fasta_stats, p_save_hits, p_main):
+        p.add(["sed", "s/~/{TILDE}/g"])  # GP-38159 (converted back to ~ in output of action_report.py)
+
+    def run(p_zcat_fasta, p_get_fasta_stats, p_save_hits, p_main, tmp_instantiated_fasta_path: str):
         Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
         # Download fasta, as appropraite
@@ -657,7 +707,45 @@ def run_gx_pipeline(args) -> None:
 
         gx_bin = f"{args.bin_dir}/gx"
 
+        # For large genomes (not prok/virus/synthetic) will mask transposon repeats (unless explicitly specified).
+        with_repeats = (
+            args.mask_transposons if args.mask_transposons is not None
+            else not any((args.div.startswith(s) for s in ["synt", "prok", "arch", "virs", "unkn"]))  # NB: unkn is for metagenomes
+        )
+
+        assert not (with_repeats and args.fasta == "/dev/stdin"), "Need multiple passes over the input, so --fasta must be a file"
+
+        if with_repeats:
+            add_zcat_fasta(p_zcat_fasta)
+
+        # GP-39234, GP-37889
+        #
+        # Putative fix to work-around the intermittent failures for external users running with Singularity,
+        # in certain HPC environments, presumably caused by concurrent access to the mounted file by the
+        # head of the pipeline (zcat /path/to/fasta | ...)
+        # and while collecting repeats stats (gx align --repeats-basis-fa=/path/to/fasta).
+        #
+        # Likely the same problem as described here:
+        # https://pawsey.atlassian.net/wiki/spaces/US/pages/51929082/Known+Issues+on+Setonix#KnownIssuesonSetonix-ParallelIOwithinContainers
+        #
+        # The erroneous behavior is not reproducible locally.
+        #
+        # The workaround is to instantiate the fasta used for collecting repeats-stats in a separate file first,
+        # such that there's no concurrent access into the same file.
+        if with_repeats and str2bool(os.getenv("GX_INSTANTIATE_FASTA", "0")):
+            p_zcat_fasta.add(["cat"], out_filename=tmp_instantiated_fasta_path)
+            p_zcat_fasta.wait()
+            assert os.path.exists(tmp_instantiated_fasta_path)
+            eprint(f"Temporary instantiated fasta: {tmp_instantiated_fasta_path}")
+
+        # NB: starting the main pipeline after conditionally instantiating fasta for repeats above
+        # (no concurrent access to the same input fasta)
         add_zcat_fasta(p_main)
+
+        # Experimental: Sort input fasta by decreasing length,
+        # e.g. if need to make output invariant when re-processing an assembly
+        # and the input order is unstable.
+        # p_main.add(["seqkit", "sort", "-l", "-r"])
 
         # GP-37176
         # ... | tee >(gx get-fasta-stats > {args.out_basename}.fasta-stats.json) | ...
@@ -677,24 +765,17 @@ def run_gx_pipeline(args) -> None:
             est_bytes = int(os.path.getsize(args.fasta) * factor)
             p_main.add(["pv", "-Wbratpe", "--interval=0.5", f"--size={est_bytes}", "--buffer-size=104857600"])
 
-        # For large genomes (not prok/virus/synthetic) will mask transposon repeats (unless explicitly specified).
-        with_repeats = (
-            args.mask_transposons if args.mask_transposons is not None
-            else not any((args.div.startswith(s) for s in ["synt", "prok", "arch", "virs", "unkn"]))  # NB: unkn is for metagenomes
-        )
-
-        assert not (with_repeats and args.fasta == "/dev/stdin"), "Need multiple passes over the input, so --fasta must be a file"
-
-        if with_repeats:
-            add_zcat_fasta(p_zcat_fasta)
-
         # NB: time and /usr/bin/time are different things.
         p_main.add(
             []
             + ([shutil.which("time"), "-v"] if args.debug and Path(shutil.which("time")).is_file() else [])
             + (["nice", "-n19"] if shutil.which("nice") else [])
             + [gx_bin, "align", f"--gx-db={args.gx_db}"]
-            + ([f"--repeats-basis-fa=/dev/fd/{p_zcat_fasta.stdout_fd}"] if with_repeats else [])
+            + (
+                [] if not with_repeats
+                else [f"--repeats-basis-fa={tmp_instantiated_fasta_path}"] if os.path.exists(tmp_instantiated_fasta_path)
+                else [f"--repeats-basis-fa=/dev/fd/{p_zcat_fasta.stdout_fd}"]  # piped from p_zcat_fasta
+            )
         )
 
         # As-if tee >(gzip -c >{args.out_basename}.hits.tsv.gz)
@@ -709,13 +790,12 @@ def run_gx_pipeline(args) -> None:
         if not args.allow_same_species:
             p_main.add(["awk", "-v", "FS=\t", f"(NR>2 && NF != 8){{ exit 111; }} ($3 != {args.tax_id})"])
 
-        
         # Add a buffer between `align` and `taxify`, so that `align` can keep producing output
         # without blocking while `taxify` is busy processing intervals for a subject-id and is
         # not actively reading stdin.
         #
         if shutil.which("pv"):
-           p_main.add(["pv", "--quiet", "--buffer-size=104857600"])
+            p_main.add(["pv", "--quiet", "--buffer-size=104857600"])
 
         p_main.add([
             gx_bin,
@@ -725,12 +805,20 @@ def run_gx_pipeline(args) -> None:
             f"--asserted-div={args.div}",
         ] + [f"--db-exclude-locs={path}" for path in (os.getenv("GX_EXCLUDE_LOCS", f"{args.bin_dir}/db_exclude.locs.tsv"),) if os.path.exists(path)])  # GP-34552
 
+        p_main.wait()
+
     # NB: nested-with instead of multi-with to support python3.8
     with ProcessPipeline() as p_zcat_fasta:
         with ProcessPipeline() as p_save_hits:
             with ProcessPipeline() as p_get_fasta_stats:
                 with ProcessPipeline() as p_main:
-                    run(p_zcat_fasta, p_get_fasta_stats, p_save_hits, p_main)
+                    tmp_instantiated_fasta_path = f"{args.out_basename}.tmp.fa"
+                    try:
+                        run(p_zcat_fasta, p_get_fasta_stats, p_save_hits, p_main, tmp_instantiated_fasta_path)
+                    finally:
+                        if os.path.exists(tmp_instantiated_fasta_path):
+                            os.remove(tmp_instantiated_fasta_path)
+
 
 
 # ---------------------------------------------------------------------------
@@ -771,13 +859,12 @@ def run_classify_taxonomy_and_action_report(args) -> None:
                 check=True, shell=True
             )
 
-            
             subprocess.run(f"echo Cleaned Fasta Stats; cat {args.out_basename}.cleaned-fasta-stats.json", check=True, shell=True)
             os.remove(f"{args.out_basename}.cleaned-fasta-stats.json")
 
 
 # ---------------------------------------------------------------------------
-def print_summary(
+def print_summary(  # pylint: disable=R0917
     # fmt: off
     args,
     file     : str,  # (.taxonomy.rpt or .fcs_gx_report.txt)
@@ -819,6 +906,17 @@ def print_summary(
     for row in arr:
         eprint("{: <30} {: >5} {: >10}".format(*row))  # pylint: disable=C0209
 
+# ---------------------------------------------------------------------------
+def str2bool(x):
+    ts = ("yes", "true", "t", "y", "1")
+    fs = ("no", "false", "f", "n", "0")
+    x = str(x).lower()
+
+    if x in ("none", ""):
+        return None
+
+    assert x in ts or x in fs, f"{x}: Boolean value expected."
+    return x in ts
 
 # ---------------------------------------------------------------------------
 def parse_args():
@@ -839,16 +937,6 @@ def parse_args():
     action_report_group = parser.add_argument_group("forward to action_report.py")
     other_group = parser.add_argument_group("other")
 
-    def str2bool(x):
-        ts = ("yes", "true", "t", "y", "1")
-        fs = ("no", "false", "f", "n", "0")
-        x = str(x).lower()
-
-        if x in ("none", ""):
-            return None
-
-        assert x in ts or x in fs, f"{x}: Boolean value expected."
-        return x in ts
 
     # -----------------------------------------------------------------------
     # Required args.
@@ -876,6 +964,29 @@ def parse_args():
 
     # -----------------------------------------------------------------------
     # Optional args.
+
+    def get_default_bin_dir():
+        # NB, prefer $_ env-var because in bazel-binary sys.argv[0] is
+        # is a path into /tmp/Bazel.runfiles/.../run_gx, not the path of the
+        # bazel-binary itself, whereas _ env-var is.
+        # https://unix.stackexchange.com/questions/292991
+        #
+        # However, if the script is called as `python run_gx.py`, then $_
+        # is the python interpreter's path, not that of the script.
+        #
+        # Additionally, the path could be a symlink, and the bin-dir
+        # is that of the symlink's target, or that of the symlink.
+
+        paths = [os.getenv("_"), sys.argv[0]]
+        paths += [os.readlink(p) for p in paths if p and Path(p).is_symlink()]
+        dirs = [os.path.dirname(p) for p in paths if p]  # NB: p can be None
+        return next((d for d in dirs if Path(d + "/gx").is_file()), ".")
+
+    opt.add_argument(
+        "--bin-dir",
+        default=os.getenv("GX_BIN_DIR", default=get_default_bin_dir()),
+        help="Path to executables.",
+    )
 
     if is_ncbi:
         opt.add_argument(
@@ -917,29 +1028,6 @@ def parse_args():
         help="Whether to mask transposons in the input. If not specified, will mask for euks only.",
     )
 
-    def get_default_bin_dir():
-        # NB, prefer $_ env-var because in bazel-binary sys.argv[0] is
-        # is a path into /tmp/Bazel.runfiles/.../run_gx, not the path of the
-        # bazel-binary itself, whereas _ env-var is.
-        # https://unix.stackexchange.com/questions/292991
-        #
-        # However, if the script is called as `python run_gx.py`, then $_
-        # is the python interpreter's path, not that of the script.
-        #
-        # Additionally, the path could be a symlink, and the bin-dir
-        # is that of the symlink's target, or that of the symlink.
-
-        paths = [os.getenv("_"), sys.argv[0]]
-        paths += [os.readlink(p) for p in paths if p and Path(p).is_symlink()]
-        dirs = [os.path.dirname(p) for p in paths if p]  # NB: p can be None
-        return next((d for d in dirs if Path(d + "/gx").is_file()), ".")
-
-    opt.add_argument(
-        "--bin-dir",
-        default=os.getenv("GX_BIN_DIR", default=get_default_bin_dir()),
-        help="Path to executables.",
-    )
-
     opt.add_argument(
         "--allow-same-species",
         type=str2bool,
@@ -950,8 +1038,9 @@ def parse_args():
 
     # -----------------------------------------------------------------------
     # copy-pasted from action_report.py (as a flag, rather than bool param)
+
+    action_report_group.add_argument("--ignore-same-kingdom", action="store_true", help="Ignore same-kingdom contamination")
     if is_ncbi:
-        action_report_group.add_argument("--ignore-same-kingdom", action="store_true")
         action_report_group.add_argument("--production-build-name")
 
     # -----------------------------------------------------------------------
@@ -1007,7 +1096,6 @@ def parse_args():
         help="Parameter to contact NCBI with minimal information about runs for assessing tool adoption. Please provide a text string such as your institution.",
     )
 
-
     # print help and error-out if no args are supplied
     if len(sys.argv) == 1:
         parser.print_help()
@@ -1015,13 +1103,15 @@ def parse_args():
 
     args = parser.parse_args()
 
+    global g_verbose
+    g_verbose = args.debug
+
     # These options were added conditionally,
     # so set them to None so we don't have to check hasattr later.
     if not is_ncbi:
         args.gc_acc = None
         args.gc_genomes_root_dir = None
         args.production_build_name = None
-        args.ignore_same_kingdom = None
 
     elif not args.gc_genomes_root_dir and args.fasta and args.fasta.startswith("ftp://"):
         eprint(
@@ -1049,9 +1139,6 @@ def main() -> None:
 
     args = parse_args()
 
-    global g_verbose
-    g_verbose = args.debug
-
     if args.generate_logfile:
         log_file_name = redirect_stdout_stderr_to_file(args)
 
@@ -1064,6 +1151,7 @@ def main() -> None:
         #
         # The simple way should be enough for our purposes.
 
+    # Resolve gx_db as path to the .gxi file, if specified as dir
     if not args.gx_db.endswith(".gxi"):
         # Can be specified uniquely in any of the following ways:
         # /dev/shm/gxdb/all.gxi /dev/shm/gxdb/all /dev/shm/gxdb/ /dev/shm/gxdb

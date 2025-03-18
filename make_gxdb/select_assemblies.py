@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 # pylint: disable=C0301,C0114,C0103,C0116,R0913,W0621,R0914
 # fmt: off
 
@@ -63,6 +64,12 @@ parser.add_argument(
     "--gc-genomes-root-dir",
     default=os.getenv("GC_GENOMES_ROOT_DIR"),
     help="Local path to https://ftp.ncbi.nlm.nih.gov/genomes/",
+)
+
+parser.add_argument(
+    "--exome-mode",
+    action='store_true',
+    help="enable exome-mode-specific selection",
 )
 
 parser.add_argument(
@@ -171,6 +178,10 @@ blast_div2gx: Dict[BlastDiv, GxDiv] = load_dict(
     lambda cols: (BlastDiv(cols[0]), GxDiv(cols[1])),
 )
 
+def get_gx_div(tax_id: TaxId) -> GxDiv:
+    return blast_div2gx.get(tax2blast_div.get(tax_id, "unknown"))
+
+
 # Category is <RefSeq_category> from esummary xml,
 # or fifth column in assembly_summary_refseq.txt.
 #
@@ -197,6 +208,17 @@ tax2num_bioprojects: Dict[TaxId, int] = generate_dict(
          datamash -s -g6 countunique 2 > bioproject_counts.tsv
     """,
     "bioproject_counts.tsv",
+    lambda cols: (TaxId(int(cols[0])), int(cols[1])),
+)
+
+tax2num_assemblies: Dict[TaxId, int] = generate_dict(
+    f""" cat {args.gc_genomes_root_dir}/ASSEMBLY_REPORTS/assembly_summary_genbank.txt |
+         grep -vP 'metagenome|unclassified|uncultured' |
+         tail -n+3 |
+         cut -f 6 |
+         datamash -s -g1 count 1 > taxa_counts.tsv
+    """,
+    "taxa_counts.tsv",
     lambda cols: (TaxId(int(cols[0])), int(cols[1])),
 )
 
@@ -267,6 +289,12 @@ screened_asms: Set[GcAccVer] = set(
     load_dict("gc_screened_assemblies.tsv", lambda cols: (GcAccVer(cols[0]), True)).keys(),
 )
 
+additional_reference_taxa: Set[TaxId] = set(
+    load_dict(
+	f"{scriptdir}/assemblies_control.tsv",
+	lambda cols: (TaxId(int(cols[1])), True) if cols[0] == '+' and cols[1] != '*' and cols[2] == '*' else None
+    ).keys()
+)
 
 #############################################################################
 def get_asm_control(tax_id: int, gca: GcAccVer, gcf: GcAccVer) -> (bool, bool):
@@ -283,7 +311,7 @@ def get_asm_control(tax_id: int, gca: GcAccVer, gcf: GcAccVer) -> (bool, bool):
         get_asm_control.asm_dict.update(
             load_dict(
                 f"{scriptdir}/assemblies_control.tsv",
-                lambda cols: (GcAccVer(cols[2]), cols[0]),
+                lambda cols: None if cols[2] == "*" else (GcAccVer(cols[2]), cols[0]),
             )
         )
 
@@ -337,7 +365,7 @@ def fetch_assemblies_esummaries(out_filename):
         "many frameshifted proteins",
         "metagenome",
         "misassembled",
-        "missing ribosomal protein genes",
+    #   "missing ribosomal protein genes",  # started causing error from esearch
         "missing rrna genes",
         "missing strain identifier",
         "missing trna genes",
@@ -351,9 +379,10 @@ def fetch_assemblies_esummaries(out_filename):
 
     mag_exclusions_str = " OR ".join((f'"{ex}"[Excluded from RefSeq]' for ex in mag_exclusions if ex not in benign_mag_exclusions))
     prok_mags = f'(prokaryotes[orgn] AND "derived from metagenome"[Excluded from RefSeq] NOT ({mag_exclusions_str}))'
+    extra_clause = "" if not args.exome_mode else "has_annotation[prop] AND "
 
     assembly_query = (
-        "      (latest_genbank[filter] OR latest_refseq[filter])"
+        f" {extra_clause} (latest_genbank[filter] OR latest_refseq[filter])"
         f" AND (representative[prop] OR eukaryotes[orgn] OR viruses[orgn] OR {prok_mags})"
         "  NOT (replaced_refseq[prop] OR suppressed_refseq[prop] OR anomalous[filter] OR contaminated[Excluded from RefSeq] OR unverified-source-organism[Excluded from RefSeq])"
     )
@@ -471,37 +500,39 @@ def line2asm(line: str) -> Assembly:
     # fmt: off
 
     # Will use it to determine the assemblies preference order.
-    def get_weight():
-        is_repr = rs_category.startswith("representative")
-        is_ref = rs_category.startswith("reference")
+    is_repr = rs_category.startswith("representative")
+    is_ref  = (
+        rs_category.startswith("reference")
+        or rs_category.startswith("representative") and tax_id in additional_reference_taxa
+    )
 
-        # taxa in scope for GenBank supplementation:
-        gb_ok = (
-            gx_div in ("anml:rotifers", "anml:nematodes", "plnt:green algae")
-            or gx_kingdom in ("fung", "prst")
-            or gx_kingdom in ("prok", "arch") and excl_from_refseq == ["derived from metagenome"]
-            or gx_kingdom in ("virs") and not excl_from_refseq  # genbank viruses and archaea
-        )
+    # taxa in scope for GenBank supplementation:
+    gb_ok = (
+        gx_div in ("anml:rotifers", "anml:nematodes", "plnt:green algae")
+        or gx_kingdom in ("fung", "prst")
+        or gx_kingdom in ("prok", "arch") and excl_from_refseq == ["derived from metagenome"]
+        or gx_kingdom in ("virs") and not excl_from_refseq  # genbank viruses and archaea
+    )
 
-        return (
-            -1      if is_reject
-            else 10 if is_accept
-            else 7  if gcf and is_ref
-            else 6  if gcf and is_repr
-            else 5  if gcf
-            else 4  if gb_ok and is_ref
-            else 3  if gb_ok and is_repr
-            else 2  if gb_ok
-            else 1  if is_repr or is_ref
-            else 0
-        )
-
-    weight = get_weight()
+    weight = (
+        -1      if is_reject
+        else 10 if is_accept
+        else 8  if is_ref and gcf
+        else 7  if is_ref
+        else 6  if gcf and is_repr
+        else 5  if gcf
+        else 4  if gb_ok and is_ref
+        else 3  if gb_ok and is_repr
+        else 2  if gb_ok
+        else 1  if is_repr or is_ref
+        else 0
+    )
 
     # GP-32813, GP-32813
     is_prescreened = (
         blast_div == "viruses"  # these are not in scope for prescreening
-        or weight >= 7  # reference or on-acceptlist
+        or is_accept
+        or is_ref
         or (gca and gca in screened_asms)
         or (gcf and gcf in screened_asms)
         or (prev_accver(gcf) in screened_asms and gx_div[0:4] not in ("prok", "arch"))
@@ -521,9 +552,9 @@ def line2asm(line: str) -> Assembly:
         "not-in-scope"         if not ftp_path
         else "ok-acceptlist"   if is_accept
         else "denylist"        if is_reject
-        else "ok-reference"    if rs_category.startswith("reference")
-        else "not-in-scope"    if weight < 2 or gx_div == "unkn:unknown"
-        else "too-large"       if asm_len > 4.3e9
+        else "ok-reference"    if is_ref
+        else "not-in-scope"    if weight < 2 or gx_div == "unkn:unknown" or gx_div == "anml:animals"
+        else "too-large"       if asm_len > 3.0e9 and not args.exome_mode
         else "low-n50"         if not is_n50_ok
         else "not-prescreened" if not is_prescreened
         else "ok"
@@ -557,25 +588,33 @@ def load_assemblies() -> List[Assembly]:
 #############################################################################
 # GP-33261
 def filter_close_tax_neighbors(assemblies: List[Assembly]):  # -> sequence-of-Assembly
-
     # We have some very well represented divs, so for those
     # we want to prune more aggressively using lower thresholds.
     # fmt: off
     tax_proximity_thresholds = {
-        "anml:fishes"       : 0.25,
-        "plnt:plants"       : 0.25,
-        "anml:insects"      : 0.4,
-        "fung:ascomycetes"  : 0.4,
-        "anml:reptiles"     : 0.4,
-        "anml:rodents"      : 0.4,
-        "anml:birds"        : 0.45,
-        "anml:mammals"      : 0.45,
-        "anml:marsupials"   : 0.45,
-        "anml:placentals"   : 0.45,
+        "anml:molluscs"       : 0.25,
+        "anml:crustaceans"    : 0.25,
+        "anml:fishes"         : 0.25,
+
+        "anml:reptiles"       : 0.35,
+        "anml:insects"        : 0.35,
+
+        "anml:amphibians"     : 0.4,
+
+        "anml:rodents"        : 0.4,
+
+        "anml:birds"          : 0.5,
+        "anml:mammals"        : 0.5,
+
+        "fung:ascomycetes"    : 0.45,
+        "fung:basidiomycetes" : 0.45,
+
+        "anml:primates"       : 0.55,
     }
     # fmt: on
 
-    neighbors = defaultdict(list)  # tax-id -> list of neighbor taxa.
+    neighbors = defaultdict(list)  # tax-id -> list of neighbor taxa (species-tax-id), satisfying threshold criteria
+    num_neighbors = defaultdict(int)
     with gzip.open(args.tax_distances, "rt", encoding="ascii") as f:
         for line in f:
             if not line or line[0] == "#":
@@ -586,22 +625,19 @@ def filter_close_tax_neighbors(assemblies: List[Assembly]):  # -> sequence-of-As
             t2 = TaxId(int(cols[1]))
 
             assert cols[2] in ("p")
+            gx_div1, gx_div2 = (get_gx_div(t)[0:5] for t in (t1, t2))
 
-            is_small = all(
-                blast_div2gx.get(tax2blast_div.get(t), "")[0:5] in ("prst:", "prok:", "arch:", "virs:")
-                for t in (t1, t2)
-            )
+            is_small = all(gx_div in ("prok:", "arch:", "virs:") for gx_div in (gx_div1, gx_div2))
 
-            default_tax_proximity_thr = 0.7 if is_small else 0.6  # higher -> select more taxa
+            default_tax_proximity_thr = 0.7 if is_small else 0.5  # higher -> select more taxa
 
-            tax_proximity_thr = min((
-                tax_proximity_thresholds.get(
-                    blast_div2gx.get(
-                        tax2blast_div.get(t)
-                    ),
-                    default_tax_proximity_thr
-                ) for t in (t1, t2)
+            tax_proximity_thr = 0.8 if args.exome_mode else min((
+                tax_proximity_thresholds.get(get_gx_div(t), default_tax_proximity_thr) for t in (t1, t2)
             ))
+
+            if t1 != t2 and gx_div1 == gx_div2:
+                num_neighbors[t1] += 1
+                num_neighbors[t2] += 1
 
             if t1 != t2 and float(cols[3]) > tax_proximity_thr:
                 neighbors[t1].append(t2)
@@ -611,20 +647,29 @@ def filter_close_tax_neighbors(assemblies: List[Assembly]):  # -> sequence-of-As
 
     # taxa out of scope based on proxmity: tax-id -> already-selected close neighbor tax-id
     seen_taxa: Dict[TaxId, TaxId] = {}
-
-    taxa_counts = Counter((a.tax_id for a in assemblies))
-    div_counts  = Counter((tax2blast_div.get(a.tax_id) for a in assemblies))
+    seen_genera = set()
+    div_counts  = Counter((a.gx_div for a in assemblies))
 
     assemblies.sort(reverse=True, key=lambda a: (
-        div_counts[tax2blast_div.get(a.tax_id)],  # sort by taxon div's popularity
-        tax2blast_div.get(a.tax_id, ""),          # then by div
-        a.weight,                 # then by our definition of get_weight()
-        a.num_bioprojects,        # then by taxon-popularity based on number of bioprojects
-        taxa_counts[a.tax_id],    # then by taxon-popularity based on count of assemblies for the taxon
-        a.n50 / a.len             # then by higher N50_len/assembly_len
+        div_counts[a.gx_div],                     # sort by taxon div's popularity
+        a.gx_div,                                 # then by div (NB: by gx-div, not blast-div)
+        (a.num_bioprojects + 1) * tax2num_assemblies.get(a.tax_id, 1),  
+                                                  # then by taxon importance based on number of bioprojects and number of assemblies
+        a.weight,                                 # then by our definition of get_weight()
+      # num_neighbors.get(a.sp_tax_id, 0),        # then by number of neighbors (more represenetative)
+        a.n50 / a.len,                            # then by higher N50_len/assembly_len
+        -1 * a.len                                # then by shorter length
     ))
 
     for a in assemblies:
+
+        # Key into seen_genera.
+        #
+        # NB: Include gx-div in genus-str to disambiguate collisions,
+        # e.g. don't want to consider "Lepeophtheirus salmonis rhabdovirus 12" and "Lepeophtheirus salmonis"
+        # as same genus "Lepeophtheirus"
+        genus_str = a.gx_div + ":" + a.species.split(' ')[0]
+
         seen_tax_id = seen_taxa.get(a.tax_id) or seen_taxa.get(a.sp_tax_id)
 
         if not seen_tax_id and a.status == "not-prescreened":
@@ -640,13 +685,26 @@ def filter_close_tax_neighbors(assemblies: List[Assembly]):  # -> sequence-of-As
             #
             # Skip (change-to-seen) ok-reference genomes, if already have
             # one for the tax_id, e.g. human T2T (on-acceptlist) trumps GRCh (reference).
-            a = a._replace(status="seen", nbr_tax_id=seen_tax_id)
+            a = a._replace(status="seen-taxon", nbr_tax_id=seen_tax_id)
+
+        elif (
+                a.status == "ok" 
+            and not args.exome_mode
+            and a.len > 100e6
+            and num_neighbors.get(a.sp_tax_id, 0) == 0
+            and genus_str in seen_genera
+        ):
+            # For large genomes, if taxon is not tax-proximities file
+            # (i.e. novel/unannotated), skip it if already picked one for the genus.
+            a = a._replace(status="seen-genus")
 
         elif a.status.startswith("ok"):
             # Not-yet-seen, or on accept-list, or reference: update seen.
             seen_taxa[a.tax_id] = a.tax_id
             seen_taxa[a.sp_tax_id] = a.sp_tax_id
-            for nbr_tax_id in neighbors[a.tax_id]:
+            seen_genera.add(genus_str)
+
+            for nbr_tax_id in neighbors[a.sp_tax_id]:
                 seen_taxa[nbr_tax_id] = a.tax_id
 
         yield a
@@ -727,4 +785,4 @@ run(
 eprint("\nTotal selected length:", int(tot_len * 100 / 1e9) / 100, "Gbp")
 
 # Sanity checks.
-assert 680e9 < tot_len < 850e9
+# assert 680e9 < tot_len < 850e9

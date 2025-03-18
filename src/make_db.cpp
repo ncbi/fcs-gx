@@ -89,10 +89,7 @@ static ivls_t get_N_runs(const fasta_seq_t& inp_chunk, const len_t min_len = 10)
 
 /////////////////////////////////////////////////////////////////////////
 // Add N-runs, low-complexity, hardmasks, softmasks; subtract those from inp-chunk's range
-static ivls_t get_indexable_intervals(
-                    const fasta_seq_t& inp_chunk,
-                     const locs_map_t& softmask_map,
-                     const locs_map_t& hardmask_map)
+static ivls_t get_indexable_intervals(const fasta_seq_t& inp_chunk, const locs_map_t& softmask_map)
 {
     const auto whole_chunk_ivl = ivl_t{ (int32_t)inp_chunk.offset + 1, (int32_t)inp_chunk.seq.size() };
 
@@ -102,10 +99,6 @@ static ivls_t get_indexable_intervals(
          % fn::append(
                  ivl_t::get_overlapping_v(
                      at_or_default(softmask_map, inp_chunk.seq_id),
-                     whole_chunk_ivl))
-         % fn::append(
-                 ivl_t::get_overlapping_v(
-                     at_or_default(hardmask_map, inp_chunk.seq_id),
                      whole_chunk_ivl));
 #if 0
     // ivls.clear(); // index the whole chunk
@@ -218,6 +211,8 @@ void gx::MakeDb(     std::istream& fasta_istr,
     const auto softmask_map  = load_locs(  softmask_istr_ptr, "softmask");
     const auto exon_locs_map = load_locs(exons_locs_istr_ptr, "exons"   );
 
+    static const bool s_exome_mode = get_env("GX_MAKEDB_EXOME_MODE", false);
+
     /////////////////////////////////////////////////////////////////////////
 
     using id_tax_vec_t = std::vector<std::pair<seq_id_str_t, tax_id_t>>;
@@ -304,6 +299,10 @@ void gx::MakeDb(     std::istream& fasta_istr,
                    && !hardmask_map.at(inp_chunk.seq_id).empty()
                    &&  hardmask_map.at(inp_chunk.seq_id).front() == ivl_t::s_whole_ivl)
         {
+            // NB: if hardmask is specified as non-whole interval but covers the whole
+            // chunk, we can't throw the chunk out entirely because we can't be making any 
+            // non-seq-length preserving operations, as the downstream chunk could be in-scope.
+
             std::cerr << "Skipping whole-hardmasked: " << inp_chunk.seq_id << "\n";
             return false;
         }
@@ -313,6 +312,9 @@ void gx::MakeDb(     std::istream& fasta_istr,
 
     /////////////////////////////////////////////////////////////////////////
 
+    // set offset_in_seq_db in seq_infos,
+    // update the current sequence length,
+    // and set inp_chunk.seq_oid
     auto update_seq_infos = [ &, last_seq_id = seq_id_str_t() ]
                             (fasta_seq_t inp_chunk) mutable -> fasta_seq_t
     {
@@ -352,27 +354,23 @@ void gx::MakeDb(     std::istream& fasta_istr,
       % fn::transform L(tax_id_t{ tsv::to_num(_) })
       % fn::to(std::set<tax_id_t>());
 
-    static constexpr auto dense_stride = 7; // for viruses, proks, exons, CDSes, repeats, human
+    static constexpr auto dense_stride = 8; // for viruses, proks, exons, CDSes, repeats, human
     static constexpr auto euk_stride = dense_stride * 2; // NB: must be multiple of dense_stride
 
-    CIndex index{ dense_stride };
+    // if enabled, will sample words based on their hash value,
+    // otherwise will sample words at fixd stride, where pos % stride == 0
+    static const bool enable_pseudorandom_sampling = get_env("GX_ENABLE_PSEUDORANDOM_SAMPLING", true);
+    static const auto large_genome_stride          = get_env("GX_LARGE_GENOME_STRIDE", euk_stride * 2);
 
-    static const auto large_genome_stride = get_env("GX_LARGE_GENOME_STRIDE", euk_stride * 2);
-    VERIFY(large_genome_stride % 3 != 0 && large_genome_stride >= euk_stride * 2);
+    VERIFY((enable_pseudorandom_sampling || dense_stride % 3 != 0)); // such that coding frame is rotated through every phase
+    VERIFY((enable_pseudorandom_sampling || large_genome_stride % 3 != 0) && large_genome_stride >= euk_stride * 2);
+
+    CIndex index{ /*pseudorandom-stride=*/ enable_pseudorandom_sampling ? dense_stride : 1u};
 
     // will be doing this part in parallel
-    auto update_index_and_translate_to2bit = [&](fasta_seq_t inp_chunk)
-      -> std::pair<fasta_seq_t, sbj_seq_t>
+    const auto update_index_and_translate_to2bit = [&](fasta_seq_t inp_chunk)
+            -> std::pair<fasta_seq_t, sbj_seq_t>
     {
-        // Apply hardmasking.
-        const auto whole_chunk_ivl = ivl_t{ (int32_t)inp_chunk.offset + 1, (int32_t)inp_chunk.seq.size() };
-        for (const auto& ivl : at_or_default(hardmask_map, inp_chunk.seq_id))
-            if (const auto sub_ivl = ivl_t::intersect(ivl, whole_chunk_ivl); sub_ivl.len > 0)
-                for (const auto i : irange{ sub_ivl.pos, sub_ivl.endpos() })
-        {
-            inp_chunk.seq[i - 1 - inp_chunk.offset] = 'N';
-        }
-
 #if 0
         const bool is_in_frame_CDS =  // GP-34257
             str::contains(inp_chunk.seq_id, "cds_")
@@ -391,20 +389,15 @@ void gx::MakeDb(     std::istream& fasta_istr,
         const bool is_cds           = str::startswith(inp_chunk.seq_id, "cds_");
         const bool is_repeat        = str::startswith(inp_chunk.seq_id, "lcl|repeat.");
         const bool is_large_genome  = large_genome_taxa.count(tax_id);
-        const auto exon_ivls        = get_exon_intervals(inp_chunk, exon_locs_map);
-        const auto other_ivls       = get_indexable_intervals(inp_chunk, softmask_map, hardmask_map);
-        num_bases_in_scope         += sum_by(other_ivls, L(_.len));
 
-        for (const auto ivls_ptr : { &exon_ivls, &other_ivls})
-            for (const auto& ivl : *ivls_ptr)
+        const auto index_ivl = [&](ivl_t ivl, bool is_exon)
         {
-            const bool is_exon = ivls_ptr == &exon_ivls;
-
             const bool use_dense_stride = (is_exon || is_cds || is_prok_or_virus || is_human || is_repeat);
 
-            const auto stride = use_dense_stride ? dense_stride
-                              : is_large_genome  ? large_genome_stride
-                              :                    euk_stride;
+            const auto stride = is_repeat && !enable_pseudorandom_sampling ? 1
+                              : use_dense_stride                           ? dense_stride
+                              : is_large_genome                            ? large_genome_stride
+                              :                                              euk_stride;
 
             VERIFY(ivl.pos > 0);
             VERIFY(inp_chunk.offset <= size_t(ivl.pos - 1));
@@ -421,20 +414,37 @@ void gx::MakeDb(     std::istream& fasta_istr,
 
                 const auto hmer = CIndex::hmer38_t{ bufs.onebit };
                 const auto pos1 = as_pos1(i, CIndex::k_word_tlen, hmer.is_flipped);
-#if 0
-                // positional sampling
-                if (i % stride != 0) {
-                     return;
+
+                if (
+                    enable_pseudorandom_sampling ?
+                        hmer.hash() % stride == 0 && last_inserted_i + 3 < i
+                      : i % stride == 0
+                   )
+                {
+                    last_inserted_i = i;
+                    index.insert(hmer, inp_chunk.seq_oid, pos1);
                 }
-#else
-                // pseudorandom sampling (but skip highly-overlapping)
-                if (hmer.hash() % stride != 0 || last_inserted_i + 3 >= i) {
-                    return;
-                }
-#endif
-                last_inserted_i = i;
-                index.insert(hmer, inp_chunk.seq_oid, pos1);
             });
+        };
+
+        if (s_exome_mode && exon_locs_map.count(inp_chunk.seq_id)) {
+            // NB: preferrably we would want to index the euk plastids and mitochondria
+            // with dense stride (like euk-exons and proks), but we don't have the data
+            // sufficiency to determine the scope here.
+            index_ivl(ivl_t{ 1, (len_t)inp_chunk.seq.size() }, true);
+            num_bases_in_scope += inp_chunk.seq.size();
+
+        } else {
+            const auto exon_ivls  = get_exon_intervals(inp_chunk, exon_locs_map);
+            const auto other_ivls = get_indexable_intervals(inp_chunk, softmask_map);
+            num_bases_in_scope   += sum_by(other_ivls, L(_.len));
+
+            for (const auto& ivl : exon_ivls) {
+                index_ivl(ivl, true);
+            }
+            for (const auto& ivl : other_ivls) {
+                index_ivl(ivl, false);
+            }
         }
 
         auto nuc2_seq = sbj_seq_t{ inp_chunk.seq };
@@ -443,8 +453,52 @@ void gx::MakeDb(     std::istream& fasta_istr,
 
     /////////////////////////////////////////////////////////////////////////
 
-    static const size_t k_chunk_stride = 100000UL;
-    static const size_t k_chunk_overlap = 100;
+    static const size_t k_chunk_stride   = s_exome_mode ? k_max_seq_len : 100000UL;
+    static const size_t k_chunk_overlap  = s_exome_mode ?             0 : 100;
+
+
+    // NB: this must be done before extracting exome, which changes the coordinates
+    const auto apply_hardmask = [&](fasta_seq_t inp_chunk) -> fasta_seq_t
+    {
+        const auto whole_chunk_ivl = ivl_t{ (int32_t)inp_chunk.offset + 1, (int32_t)inp_chunk.seq.size() };
+        for (const auto& ivl : at_or_default(hardmask_map, inp_chunk.seq_id))
+            if (const auto sub_ivl = ivl_t::intersect(ivl, whole_chunk_ivl); sub_ivl.len > 0)
+                for (const auto i : irange{ sub_ivl.pos, sub_ivl.endpos() })
+        {
+            inp_chunk.seq[i - 1 - inp_chunk.offset] = 'N';
+        }
+
+        return inp_chunk;
+    };
+
+    const auto extract_exome = [&](fasta_seq_t qry_chunk) -> fasta_seq_t
+    {
+        if (!s_exome_mode || !exon_locs_map.count(qry_chunk.seq_id)) {
+            return qry_chunk;
+        }
+
+        // expecting whole-seq (chunk-stride k_max_seq_len)
+        VERIFY(qry_chunk.offset == 0);
+
+        const ivls_t& ivls = exon_locs_map.at(qry_chunk.seq_id);
+        auto exome_seq = iupacna_seq_t{};
+        ivl_t::verify_regular(ivls);
+        for (const auto& ivl : ivls) {
+            if (ivl.endpos() - 1 <= (int64_t)qry_chunk.seq.size()) {
+                exome_seq += qry_chunk.seq.substr(ivl.pos - 1, ivl.len);
+            } else {
+                std::cerr << "Warning: skipping exon feature (out of bounds); seq-id:" 
+                          << qry_chunk.seq_id
+                          << "; len:" << qry_chunk.seq.size()
+                          << "; exon-ivl:" << ivl.to_string()
+                          << "\n";
+            }
+        }
+        qry_chunk.seq = std::move(exome_seq);
+
+        return qry_chunk;
+    };
+
 
     /////////////////////////////////////////////////////////////////////////
     // We will be rolling our own super-simple sequence local-storage for
@@ -478,7 +532,7 @@ void gx::MakeDb(     std::istream& fasta_istr,
 
         // To ensure that truncated-to-stride nuc2_seq internal storage
         // is aligned to byte boundary (one byte fits 4 bps)
-        static_assert(k_chunk_stride % 4 == 0, "");
+        VERIFY(k_chunk_stride % 4 == 0);
 
         const auto si = seq_infos.at(chunk.seq_oid);
 
@@ -517,7 +571,14 @@ void gx::MakeDb(     std::istream& fasta_istr,
                 dump_seq(
                     update_index_and_translate_to2bit(
                         update_seq_infos(
-                            std::move(qry_chunk)))); // TODO: missing CDS-group-and-filter logic here (see below)
+                            extract_exome(
+                                apply_hardmask(
+                                    std::move(qry_chunk)
+                                )
+                            )
+                        )
+                    )
+                ); // TODO: missing CDS-group-and-filter logic here (see below)
             }
         }
     } else {
@@ -532,18 +593,26 @@ void gx::MakeDb(     std::istream& fasta_istr,
             const auto sym_b = get_gene_symbol_from_defline(b.defline);
             return !sym_a.empty() && !sym_b.empty() && sym_a == sym_b;
         })
-      % fn::transform([](std::vector<fasta_seq_t> group)
+      % fn::transform([](std::vector<fasta_seq_t> group) // return longest seq per gene
         {
             VERIFY(!group.empty());
-            const auto id_of_longest = std::max_element(group.begin(), group.end(), BY(_.seq.size()))->seq_id;
-            return std::move(group) % fn::where L(_.seq_id == id_of_longest);
+            return std::move(*std::max_element(group.begin(), group.end(), BY(_.seq.size())));
         })
-      % fn::concat()
 #endif
       % fn::where(in_scope)
+      % fn::transform(apply_hardmask)
+      % fn::transform(extract_exome)
       % fn::transform(update_seq_infos)
       % fn::transform_in_parallel(update_index_and_translate_to2bit).queue_capacity(num_cores)
       % fn::for_each(dump_seq);
+    }
+
+    // In exome mode, for sequences for which we extracted exomes, add "lcl|exome." prefixes to the seq-ids.
+    if (s_exome_mode)
+        for (auto& si : seq_infos)
+            if (exon_locs_map.count(seq_id_str_t{ si.get_seq_id() }))
+    {
+        si.set_seq_id(std::string{ "lcl|exome." } + si.get_seq_id());
     }
 
     std::ofstream o_seq_info{ str::replace_suffix(out_path, ".gxi", ".seq_info.tsv") };
@@ -588,6 +657,10 @@ void gx::MakeDb(     std::istream& fasta_istr,
         j["seqs" ]      = json5::int_t(num_seqs);
         j["Gbp"]        = float(num_bases)/1e9f;
 
+        if (s_exome_mode) {
+            j["exomes"] = true;
+        }
+
         VERIFY(str::endswith(out_path, ".gxi"));
         std::ofstream{ str::replace_suffix(out_path, ".gxi", ".meta.jsonl") } << j << "\n";
     }
@@ -607,7 +680,7 @@ void gx::MakeDb(     std::istream& fasta_istr,
 
     t = timer{};
     std::cerr << "Deallocating..." << std::endl;
-    index = CIndex{};
+    index = CIndex{ 1 };
     std::cerr << "Deallocated index in " << float(t)/60 << " minutes.\n\n";
 }
 

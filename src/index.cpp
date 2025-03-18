@@ -115,11 +115,11 @@ void gx::CIndex::finalize(const seq_infos_t& seq_infos, const tax_map_t& taxa)
     std::atomic_size_t nodes_total_pre_filter = {};
     std::atomic_size_t nodes_total_post_filter = {};
 
-    static const auto num_threads = get_env("GX_NUM_CORES", std::min(32U, std::thread::hardware_concurrency() - 1));
-    static const auto keep_singleton_nodes = get_env("GX_KEEP_SINGLETON_NODES", false);
+    static const auto num_threads          = get_env("GX_NUM_CORES", std::min(32U, std::thread::hardware_concurrency() - 1));
+    static const auto keep_singleton_nodes = get_env("GX_KEEP_SINGLETON_NODES", true);
+    static const bool s_exome_mode         = get_env("GX_MAKEDB_EXOME_MODE", false);
 
-    const auto is_node_repeat_specific = 
-        L( std::strncmp(seq_infos.at(_.seq_oid).get_seq_id(), "lcl|repeat.", 11) == 0 );
+    const auto is_node_repeat_specific = L(seq_infos.at(_.seq_oid).is_consensus_repeat_model());
 
     for_each_in_parallel(m_buckets, num_threads, [&](nodes_t& bucket_nodes)
     {
@@ -141,9 +141,10 @@ void gx::CIndex::finalize(const seq_infos_t& seq_infos, const tax_map_t& taxa)
         // seq-oids are collated by taxa,
         // threfore nodes are collated by (key8, tax-id).
 
-        for_each_group_by( bucket_nodes,
-                           L(_.subkey8),
-                           [&](const auto subnodes_v)
+        if (!s_exome_mode)
+            for_each_group_by( bucket_nodes,
+                               L(_.subkey8),
+                               [&](const auto subnodes_v)
         {
             // sanity-check
             {
@@ -486,10 +487,7 @@ void CIndex::from_stream(std::istream& istr)
 
     const db_version_t db_version = ser::from_stream(istr);
     if (db_version/100 > k_exec_db_version/100) {
-        GX_THROW(
-              "The version of the index ("              + std::to_string(db_version) 
-            + ") is incompatible with the executable (" + std::to_string(k_exec_db_version)
-            + ").");
+        GX_THROW("The gx-database is not compatible with this version of the executable. Please update the software to the latest version.");
     }
 
     ser::skip_padding(istr);

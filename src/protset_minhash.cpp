@@ -57,8 +57,8 @@ static std::string make_reduced_alphabet(const std::string& alphabet_grouping, u
 // Output is 1kb base-64 min-hash signature.
 std::string gx::MakeProtsetMinhash(std::istream& fasta_istr)
 {
-    constexpr auto mer_bitwidth = 30;
-    constexpr auto minhash_size = 1024ul;
+    constexpr auto mer_bitwidth = 30ul;
+    constexpr auto minhash_size = 4096ul;
 
 #if 1
     constexpr auto alphabet_bitwidth = 2;
@@ -175,7 +175,7 @@ void gx::PairwiseCompareMinHashes(std::istream& istr, std::ostream& ostr)
     for (const tsv::row_t& row : tsv::from(istr)) {
         VERIFY(row.size() == 2);
         if (row[1] != "NULL") {
-            VERIFY(row[1].size() == 1024);
+            VERIFY(row[1].size() == 4096);
             inps.emplace_back(std::make_pair(row[0], row[1]));
         }
     }
@@ -187,8 +187,8 @@ void gx::PairwiseCompareMinHashes(std::istream& istr, std::ostream& ostr)
     for (const auto i : irange{ inps.size() })
         for (const auto j : irange{ i + 1, inps.size() })
     {
-        auto f = (float)count_equal_bytes(inps[i].second, inps[j].second) / 1024.0f;
-        f = std::max(f - (1 - f) / 64, 0.0f); // adjust for expected number of collisions
+        auto f = (float)count_equal_bytes(inps[i].second, inps[j].second) / 4096.0f;
+        f = std::max(f - (1 - f) / 64, 0.0f); // adjust for expected number of collisions (since we're using base-64)
         if (f >= min_reportable_threshold) {
             ostr << inps[i].first << "\t" << inps[j].first << "\t" << f << "\n";
         }

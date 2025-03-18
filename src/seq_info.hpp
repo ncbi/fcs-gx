@@ -57,13 +57,19 @@ struct seq_info_t
 
     void set_seq_id(const std::string& id)
     {
-        VERIFY(id.size()+1 <= seq_id.size());
+        VERIFY(id.size() + 1 <= seq_id.size());
+        std::fill(seq_id.begin(), seq_id.end(), 0);
         strncpy(seq_id.data(), id.data(), id.size());
     }
 
     const char* get_seq_id() const
     {
         return seq_id.data();
+    }
+
+    bool is_consensus_repeat_model() const
+    {
+        return std::strncmp(get_seq_id(), "lcl|repeat.", 11) == 0;
     }
 
     bool operator<(const seq_info_t& other) const

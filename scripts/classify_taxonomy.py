@@ -24,6 +24,7 @@
 """
 # pylint: disable=C0301,C0114,C0103,C0116,C0115,R0914,R0916,R0911,W0702
 # fmt: off
+# Noncompliant@Checkmarx.path_traversal:suppress
 
 import sys
 assert sys.version_info.major >= 3 and sys.version_info.minor >= 8, f"Python version: {sys.version_info}. Require python 3.8 or newer."
@@ -65,23 +66,69 @@ def is_vir_or_synt(div) -> bool:
 def is_euk(div) -> bool:
     return not is_prok(div) and not is_vir_or_synt(div)
 
+mammals_divs        = [f"anml:{s}" for s in ["mammals", "rodents", "primates", "marsupials"]]
+vertebrates_divs    = [f"anml:{s}" for s in ["fishes", "reptiles", "amphibians", "birds", "vertebrates"]] + mammals_divs
 
-vertebrates = [f"anml:{s}" for s in ["mammals", "fishes", "reptiles", "amphibians", "rodents", "birds", "vertebrates", "primates", "marsupials"]]
+# Divgroups are defined based on preponderance of co-occurrence in inferred-divs.
+#
+# find /path/to/screens/new_submissions/ -name '*.taxonomy.rpt' | xargs head -q -n1 | sed -E 's/^##//' | jq -r '.[1]."run-info"."inferred-primary-divs" | @tsv' | awkt 'NF > 1' > inferred_divs.tsv
+# cat inferred_divs.tsv | cut -f1,2 | awkt '($1 < $2){ print $1,$2 } ($2 < $1){ print $2,$1 }' | tabulate | grep -vP 'proteobact.*proteobact' | grep -Pv 'prok:bacteria|prok:firmicutes|fung:fungi|virs:viruses'
+#
+# NB: prok:firmicutes co-occur with many other prok divs, but it's well-represented in db,
+# so if there's an asserted-div=firmicutes that's absent in inferred-divs, we don't want to
+# augment it, but rather treat it as a case of egregious contamination. So we exclude it from divgroups.
+divgroups = [
+    [f"prok:{s}proteobacteria" for s in ("", "a-", "b-", "g-", "d-")],
+    ["prok:high GC Gram+"       , "prok:actinobacteria"],
+    ["prok:high GC Gram+"       , "prok:a-proteobacteria"],
+    ["prok:high GC Gram+"       , "prok:GNS bacteria"],
+    ["prok:cyanobacteria"       , "prok:g-proteobacteria"],
+    ["prok:CFB group bacteria"  , "prok:g-proteobacteria"],
+    ["prok:CFB group bacteria"  , "prok:verrucomicrobia"],
+    ["fung:ascomycetes"         , "fung:budding yeasts"],
+    ["plnt:mosses"              , "plnt:plants"],
+    ["anml:insects"             , "anml:crustaceans", "anml:molluscs"],
+    ["anml:birds"               , "anml:reptiles"],
+    mammals_divs,
+]
+
 def tax_kingdom(div): # taxonomic kingdom "prok", "virs", etc; splitting animals into vertabrates and invertebrates
     assert div[4] == ":" or div == "synthetic", div
-    return div[:4] if not div.startswith("anml:") else "vrbt" if div in vertebrates else "ivrt"
+    return div[:4] if not div.startswith("anml:") else "vrbt" if div in vertebrates_divs else "ivrt"
 
 
 def is_same_kingdom(div1: str, div2: str) -> bool:
     null_divs = ["NULL", "synthetic"]
+
     if div1 in null_divs or div2 in null_divs:
         return False
+
     assert div1[4] == ":" and div2[4] == ":", (div1, div2)
-    return tax_kingdom(div1) == tax_kingdom(div2) and (not tax_kingdom(div1) == "anml" or (div1 in vertebrates) == (div2 in vertebrates))
+
+    return (
+        tax_kingdom(div1) == tax_kingdom(div2)
+        and (tax_kingdom(div1) != "anml" or (div1 in vertebrates_divs) == (div2 in vertebrates_divs))
+    )
 
 assert     is_same_kingdom("anml:mammals", "anml:fishes")
 assert not is_same_kingdom("anml:mammals", "anml:nematodes")  # vertebrate / not-vertebrate
 assert not is_same_kingdom("anml:mammals", "prok:bacteria")
+
+
+# TODO: some or all uses is_same_kingdom might be better served by are_close_divs()
+def are_close_divs(div1: str, div2: str) -> bool:
+    return tax_kingdom(div1) == tax_kingdom(div2) and (
+        div1 == div2
+        or any(superdiv in (div1, div2) for superdiv in ("fung:fungi", "prok:bacteria", "virs:viruses"))
+        or any(div1 in divgroup and div2 in divgroup for divgroup in divgroups)
+    )
+
+assert     are_close_divs("anml:insects",  "anml:crustaceans")     # in same divgroup
+assert     are_close_divs("anml:rodents",  "anml:primates")        # in same divgroup
+assert not are_close_divs("anml:insects",  "anml:rodents")         # in different divgroups
+assert     are_close_divs("fung:fungi",    "fung:whatever")        # same-kingdom, one of divs is generic
+assert     are_close_divs("prok:bacteria", "prok:proteobacteria")  # same-kingdom, one of divs is generic
+assert not are_close_divs("fung:fungi",    "prok:whatever")        # different kingdoms
 
 
 def as_readable(num) -> str:
@@ -398,14 +445,6 @@ def adjust_divs(species, asserted_div, inferred_primary_divs): # -> (primary_div
         or (species == "genus_undefined" and is_prok(asserted_div)) # GP-36602
     )
 
-    is_asserted_div_compatible = (
-        not primary_divs
-        or (asserted_div == "prok:proteobacteria" and any("proteobacteria"     in pd for pd in primary_divs))
-        or (asserted_div == "prok:actinobacteria" and any("prok:high GC Gram+" == pd for pd in primary_divs))
-        or (asserted_div == "prok:bacteria"       and any("prok:"              in pd for pd in primary_divs))
-        or ("prok:" in asserted_div               and any("prok:bacteria"      == pd for pd in primary_divs))
-    )
-
     # Replace-or-append primary-divs with asserted-div as appropriate.
     if asserted_div == "virs:viruses":  # GP-33387, GP-34316
         primary_divs = ["virs:viruses", "virs:eukaryotic viruses", "virs:prokaryotic viruses"]
@@ -415,35 +454,41 @@ def adjust_divs(species, asserted_div, inferred_primary_divs): # -> (primary_div
 
     elif asserted_div == "unkn:metagenomes": # GP-33795
         primary_divs = ["unkn:metagenomes"]
-        contam_divs = vertebrates  # should be chordates, but close enough. What about "large" invertebrates?
+        contam_divs = vertebrates_divs  # should be chordates, but close enough. What about "large" invertebrates?
 
-    elif asserted_div == "unkn:unknown" and primary_divs or asserted_div in primary_divs:
+    elif (
+        asserted_div in primary_divs
+        or (asserted_div == "unkn:unknown" and primary_divs)
         # NB: if primary_divs is empty, fall-through to the next rule. JIRA:GP-37686
+    ):
         pass
 
     elif (
         not primary_divs
-        or (is_weakly_named_species and is_asserted_div_compatible)
-        or (is_same_kingdom(asserted_div, primary_divs[0]) and asserted_div not in well_represented_divs)
+        or are_close_divs(asserted_div, primary_divs[0])
+        or (
+            # asserted-div not well-represented fung or prok div.
+            is_same_kingdom(asserted_div, primary_divs[0])
+            and tax_kingdom(asserted_div) in ("prok", "fung")
+            and asserted_div not in well_represented_divs
+        )
     ):
         primary_divs = [asserted_div] + primary_divs
-        eprint(f"\n    * * * Adding asserted tax-div '{asserted_div}' to the set of primary divs",
-               " (weakly-named species)" if (is_weakly_named_species and is_asserted_div_compatible) else "",
-               ". * * *\n", sep="")
+        eprint("\n\n-----------------------------------------------------------------------------------------------------------")
+        eprint(f"NOTE: Adding asserted tax-div '{asserted_div}' to the set of inferred primary divs {inferred_primary_divs}",
+               " (weakly-named species)." if is_weakly_named_species else ".", sep = "")
+        eprint("-----------------------------------------------------------------------------------------------------------\n")
 
     else :  # GP-33376: if different-kingdom or asserted-div is high-confidence but missing from primary-divs,
             # then trust the asserted-div, and treat the inferred-divs as contamination (similar to metagenomes case).
         primary_divs = [asserted_div]
         contam_divs = inferred_primary_divs.copy()
 
-        eprint("\n\n-----------------------------------------------------------------------------")
-        eprint(f"Warning: Asserted tax-div '{asserted_div}' is " + (
-                "from a different tax-kingdom than the inferred-primary-divs." if not is_same_kingdom(asserted_div, primary_divs[0])
-           else "well-represented in db, but absent from inferred-primary-divs."
-        ))
+        eprint("\n\n-----------------------------------------------------------------------------------------------------------")
+        eprint(f"Warning: Asserted tax-div '{asserted_div}' is distant and absent from inferred primary divs {inferred_primary_divs}.")
         eprint("This means that either asserted tax-div is incorrect, or the input is predominantly contamination.")
         eprint("Will trust the asserted div and treat inferred-primary-divs as contaminants.")
-        eprint("-----------------------------------------------------------------------------\n")
+        eprint("-----------------------------------------------------------------------------------------------------------\n")
 
     return primary_divs, contam_divs
 
@@ -496,7 +541,7 @@ def classify_taxonomy(args):
     min_cvg_frac = max(0.2, 0.6 * (1 - agg_cvg_frac))
     eprint(f"Minimum contam. coverage   : { as_pct(min_cvg_frac) }%")
 
-    out_filepath = None if not args.out_dir else args.out_dir + "/" + os.path.basename(args.taxonomy_rpt)
+    out_filepath = None if not args.out_dir else os.path.join(args.out_dir, os.path.basename(args.taxonomy_rpt))
     fout = (
         sys.stdout if not args.out_dir
         else gzip.open(out_filepath, "wt", encoding="utf8") if out_filepath.endswith(".gz")

@@ -119,7 +119,7 @@ public:
 public:
     ///////////////////////////////////////////////////////////////////
 
-    CIndex(size_t pseudorandom_stride = 8)
+    CIndex(size_t pseudorandom_stride)
       : m_pseudorandom_stride(pseudorandom_stride)
     {
         VERIFY(m_pseudorandom_stride >= 1);

@@ -44,13 +44,13 @@ This file outlines how to run FCS-GX from the source code.
 ### For normal runs, use the complete *all* database:
 - Download the database to the local disk, and then copy it to a RAM-backed tmpfs or ramfs location (we will use `/dev/shm/gxdb` in examples below).
    ```
-   ./scripts/sync_files.py sync-in-place --mft=https://ftp.ncbi.nlm.nih.gov/genomes/TOOLS/FCS/database/latest/all.manifest --dir=/path/to/local/disk/gxdb
-   ./scripts/sync_files.py sync-in-place --mft=/path/to/local/disk/gxdb/all.manifest --dir=/dev/shm/gxdb
+   ./scripts/sync_files.py get --mft=https://ftp.ncbi.nlm.nih.gov/genomes/TOOLS/FCS/database/latest/all.manifest --dir=/path/to/local/disk/gxdb
+   ./scripts/sync_files.py get --mft=/path/to/local/disk/gxdb/all.manifest --dir=/dev/shm/gxdb
    ```
 
 - Alternatively, you may skip the disk and download to tmpfs directly.
    ```
-   ./scripts/sync_files.py  sync-in-place --mft=https://ftp.ncbi.nlm.nih.gov/genomes/TOOLS/FCS/database/latest/all.manifest  --dir=/dev/shm/gxdb
+   ./scripts/sync_files.py get --mft=https://ftp.ncbi.nlm.nih.gov/genomes/TOOLS/FCS/database/latest/all.manifest  --dir=/dev/shm/gxdb
    ```
 
 - Alternatively, you can `vmtouch` downloaded database on local disk and use it directly instead of tmpfs.
